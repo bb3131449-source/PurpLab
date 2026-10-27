@@ -5,8 +5,6 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,13 +50,6 @@ const (
 	titleFade  = 0.75
 	titleMid   = 0.5
 	titleGap   = 2
-	titleRow   = 0
-
-	subRow    = 1
-	subIndent = titleGap + 1
-	subDelay  = 0.6
-	subStep   = 0.025
-	subFade   = 0.6
 
 	settle = 0.12
 
@@ -86,9 +77,7 @@ var (
 
 	titleDark  = RGB{14, 12, 20}
 	titleRunes = []rune(titleText)
-
-	subRunes  []rune
-	subTarget []RGB
+	titleRow   = logo.h / 2
 
 	grid [][]Cell
 	lin  [256]float64
@@ -150,36 +139,9 @@ func init() {
 		}
 	}
 
-	subRunes = []rune(readVersion() + " • " + runtime.Version())
-	subTarget = make([]RGB, len(subRunes))
-	for i, ch := range subRunes {
-		if ch == '•' {
-			subTarget[i] = color[0]
-		} else {
-			subTarget[i] = gray[1]
-		}
-	}
-
 	logoEnd := colorDelay + sweepSpread + sweepJitter + colorDur
 	titleEnd := titleDelay + float64(len(titleRunes)-1)*titleStep + titleFade
-	subEnd := subDelay + float64(len(subRunes)-1)*subStep + subFade
-	unlockAt = math.Max(math.Max(logoEnd, titleEnd), subEnd) + settle
-}
-
-func readVersion() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "unknown"
-	}
-	data, err := os.ReadFile(filepath.Join(home, "PurpNet", ".version"))
-	if err != nil {
-		return "unknown"
-	}
-	v := strings.TrimSpace(string(data))
-	if v == "" {
-		return "unknown"
-	}
-	return v
+	unlockAt = math.Max(logoEnd, titleEnd) + settle
 }
 
 func jitter(x, r int) float64 {
@@ -372,14 +334,6 @@ func titleColor(i int, t float64) (RGB, bool) {
 	return mix(color[0], white, (k-titleMid)/(1-titleMid)), true
 }
 
-func subColor(i int, t float64) (RGB, bool) {
-	u := (t - subDelay - float64(i)*subStep) / subFade
-	if u <= 0 {
-		return RGB{}, false
-	}
-	return mix(titleDark, subTarget[i], smootherstep(u)), true
-}
-
 func appendFG(b []byte, c RGB) []byte {
 	b = append(b, "\x1b[38;2;"...)
 	b = strconv.AppendInt(b, int64(c[0]), 10)
@@ -442,26 +396,6 @@ func frame(t float64) []byte {
 			b = append(b, "\x1b[m"...)
 		}
 
-		if r == subRow {
-			for g := 0; g < subIndent; g++ {
-				b = append(b, ' ')
-			}
-			have = false
-			for i, ch := range subRunes {
-				col, ok := subColor(i, t)
-				if !ok {
-					b = append(b, ' ')
-					continue
-				}
-				if !have || col != last {
-					b = appendFG(b, col)
-					last, have = col, true
-				}
-				b = utf8.AppendRune(b, ch)
-			}
-			b = append(b, "\x1b[m"...)
-		}
-
 		b = append(b, "\x1b[K\n"...)
 	}
 
@@ -477,10 +411,6 @@ func plainFrame() []byte {
 		if r == titleRow {
 			b = append(b, strings.Repeat(" ", titleGap)...)
 			b = append(b, titleText...)
-		}
-		if r == subRow {
-			b = append(b, strings.Repeat(" ", subIndent)...)
-			b = append(b, string(subRunes)...)
 		}
 		b = append(b, '\n')
 	}
@@ -693,3 +623,4 @@ func main() {
 		<-ticker.C
 	}
 }
+
