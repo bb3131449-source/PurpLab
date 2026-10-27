@@ -3,16 +3,12 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -20,753 +16,133 @@ import (
 )
 
 type RGB [3]int
-type Vec [3]float64
+
+type Cell struct {
+	ch           rune
+	gray, target RGB
+	start        float64
+}
 
 type Logo struct {
 	rows [][]rune
 	w, h int
 }
 
-type Cell struct {
-	ch     rune
-	gray   RGB
-	target RGB
-	start  float64
-}
-
-type Version struct {
-	raw   string
-	parts []int
-}
-
-func (a Version) compare(b Version) int {
-	n := len(a.parts)
-	if len(b.parts) > n {
-		n = len(b.parts)
-	}
-	for i := 0; i < n; i++ {
-		var x, y int
-		if i < len(a.parts) {
-			x = a.parts[i]
-		}
-		if i < len(b.parts) {
-			y = b.parts[i]
-		}
-		if x < y {
-			return -1
-		}
-		if x > y {
-			return 1
-		}
-	}
-	return 0
-}
-
-type errKind int
-
 const (
-	errOK errKind = iota
-	errTimeout
-	errDNS
-	errRefused
-	errTLS
-	errNet
-	errHTTP404
-	errHTTP403
-	errHTTP5xx
-	errHTTPOther
-	errEmpty
-	errHTML
-	errNoKey
-	errBadValue
-	errLocalNoFile
-	errLocalPerm
-	errLocalOther
-	errUnknown
-)
-
-var errTexts = map[errKind]string{
-	errTimeout:     "Network timeout",
-	errDNS:         "Host not found",
-	errRefused:     "Connection refused",
-	errTLS:         "Certificate error",
-	errNet:         "Network error",
-	errHTTP404:     "Update not found",
-	errHTTP403:     "Access denied",
-	errHTTP5xx:     "Server error",
-	errHTTPOther:   "HTTP error",
-	errEmpty:       "Empty response",
-	errHTML:        "Invalid response",
-	errNoKey:       "Missing version",
-	errBadValue:    "Invalid version",
-	errLocalNoFile: "Local file missing",
-	errLocalPerm:   "Permission denied",
-	errLocalOther:  "Cannot read local",
-	errUnknown:     "Verification error",
-}
-
-type StatusInfo struct {
-	Text    string
-	Target  RGB
-	Runes   []rune
-	Detail  string
-	ReadyAt time.Time
-}
-
-const (
-	fps = 60
-
-	appearDur  = 0.22
-	appearLag  = 0.3
-	colorDelay = 0.1
-	colorDur   = 0.6
-
+	fps         = 60
+	appearDur   = 0.2
+	appearLag   = 0.05
+	colorDelay  = appearLag + appearDur
+	colorDur    = 0.6
 	sweepSpread = 0.65
 	sweepJitter = 0.07
-
-	glowAmount = 0.5
-	glowTint   = 0.3
-
-	titleText  = "PurpNet!"
-	titleDelay = 0.3
-	titleStep  = 0.06
-	titleFade  = 0.75
-	titleMid   = 0.5
-	titleGap   = 2
-
-	checkingFade = 0.5
-	statusGap    = 2
-
-	settle = 0.12
+	glowAmount  = 0.5
+	glowTint    = 0.3
+	titleText   = "PurpNet!"
+	titleDelay  = 0
+	titleStep   = 0
+	titleFade   = 0.35
+	titleMid    = 0.5
+	titleGap    = 2
 
 	bgQueryTimeout = 180 * time.Millisecond
-	versionTimeout = 10 * time.Second
 
-	versionURL = "https://raw.githubusercontent.com/bb3131449-source/PurpNet/main/version.toml"
-
-	detailMax = 120
-
-	ioctlGet   = 0x5401
-	ioctlSet   = 0x5402
-	ioctlSetFl = 0x5404
-	ioctlFlush = 0x540B
+	tcsetsf = 0x5404
+	tcflsh  = 0x540B
 )
 
 var (
-	logo = newLogo([]string{
-		" ▐▛██▜▌",
-		"▝▜████▛▘",
-		" ▐▌▐▌▐▌",
-	})
-
-	white  = RGB{255, 255, 255}
-	purple = RGB{163, 140, 255}
-
-	gray  = []RGB{{225, 225, 225}, {140, 140, 140}}
-	color = []RGB{{163, 140, 255}, {61, 29, 191}}
-
-	glowColor RGB
-	dimColor  RGB
-
-	titleDark  = RGB{14, 12, 20}
-	titleRunes = []rune(titleText)
-	titleRow   = 0
-	statusRow  = 1
-
-	checkingRunes = []rune("Checking...")
-
-	currentStatus atomic.Pointer[StatusInfo]
-
-	grid [][]Cell
-	lin  [256]float64
-	buf  []byte
-
-	baseEnd   float64
-	animStart time.Time
-
-	stdinFd = int(os.Stdin.Fd())
-
-	out     = os.Stdout
-	mu      sync.Mutex
-	printed bool
-
-	origTerm syscall.Termios
-	rawOn    atomic.Bool
-
-	readerStop  chan struct{}
-	readerDone  chan struct{}
-	stopOnce    sync.Once
-	unlockOnce  sync.Once
-	restoreOnce sync.Once
-	unlocked    bool
+	logo         = newLogo(" ▐▛██▜▌", "▝▜████▛▘", " ▐▌▐▌▐▌")
+	titleRow     = 0
+	versionRow   = 1
+	white        = RGB{255, 255, 255}
+	gray         = []RGB{{225, 225, 225}, {140, 140, 140}}
+	color        = []RGB{{170, 170, 255}, {60, 30, 180}}
+	glow         RGB
+	titleDark    = RGB{14, 12, 20}
+	titleRunes   = []rune(titleText)
+	versionText  = loadVersion()
+	versionRunes = []rune(versionText)
+	baseEnd      = math.Max(
+		colorDelay+sweepSpread+sweepJitter+colorDur,
+		math.Max(
+			titleDelay+float64(len(titleRunes)-1)*titleStep+titleFade,
+			titleDelay+float64(max(len(versionRunes)-1, 0))*titleStep+titleFade,
+		),
+	)
+	lin      [256]float64
+	out      = os.Stdout
+	exitKeys = map[byte]int{3: 130, 4: 0, 28: 131}
 )
 
-func debugEnabled() bool { return os.Getenv("PURPNET_DEBUG") != "" }
-
-func debugf(format string, args ...any) {
-	if debugEnabled() {
-		mu.Lock()
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
-		mu.Unlock()
+func init() {
+	for i := range lin {
+		lin[i] = math.Pow(float64(i)/255, 2.2)
 	}
+	glow = mix(white, color[0], glowTint)
 }
 
-func newLogo(src []string) Logo {
+func loadVersion() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, "PurpNet", "version.toml"))
+	if err != nil {
+		return ""
+	}
+	var v, st string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		k, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		switch k {
+		case "version":
+			v = val
+		case "status":
+			st = val
+		}
+	}
+	if v == "" {
+		return ""
+	}
+	if st == "" {
+		return v
+	}
+	st = strings.ToUpper(st[:1]) + st[1:]
+	return v + " • " + st
+}
+
+func newLogo(src ...string) Logo {
 	l := Logo{h: len(src)}
 	for _, s := range src {
 		rs := []rune(s)
 		l.rows = append(l.rows, rs)
-		if len(rs) > l.w {
-			l.w = len(rs)
+		l.w = max(l.w, len(rs))
+	}
+	for i, rs := range l.rows {
+		for len(rs) < l.w {
+			rs = append(rs, ' ')
 		}
+		l.rows[i] = rs
 	}
 	return l
 }
 
-func init() {
-	for i := range lin {
-		lin[i] = math.Pow(float64(i)/255.0, 2.2)
-	}
+func clamp01(v float64) float64 { return max(0, min(1, v)) }
 
-	glowColor = mix(white, color[0], glowTint)
-	dimColor = mix(titleDark, white, 0.3)
-
-	grid = make([][]Cell, logo.h)
-	for r, row := range logo.rows {
-		grid[r] = make([]Cell, logo.w)
-		for x := 0; x < logo.w; x++ {
-			ch := ' '
-			if x < len(row) {
-				ch = row[x]
-			}
-			c := Cell{ch: ch}
-			if ch != ' ' {
-				c.gray = grad(gray, x, r)
-				c.target = grad(color, x, r)
-				c.start = sweepT(x, r)*sweepSpread + sweepJitter*jitter(x, r)
-			}
-			grid[r][x] = c
-		}
-	}
-
-	logoEnd := colorDelay + sweepSpread + sweepJitter + colorDur
-	titleEnd := titleDelay + float64(len(titleRunes)-1)*titleStep + titleFade
-	baseEnd = math.Max(logoEnd, titleEnd) + settle
+func smoothstep(x float64) float64 {
+	x = clamp01(x)
+	return x * x * (3 - 2*x)
 }
-
-func jitter(x, r int) float64 {
-	v := math.Sin(float64(x)*12.9898+float64(r)*78.233) * 43758.5453
-	return v - math.Floor(v)
-}
-
-func classifyNetErr(err error) errKind {
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "handshake timeout"),
-		strings.Contains(msg, "context deadline exceeded"),
-		strings.Contains(msg, "client.timeout"),
-		strings.Contains(msg, "i/o timeout"):
-		return errTimeout
-	case strings.Contains(msg, "no such host"),
-		strings.Contains(msg, "name resolution"),
-		strings.Contains(msg, "lookup "):
-		return errDNS
-	case strings.Contains(msg, "connection refused"):
-		return errRefused
-	case strings.Contains(msg, "x509:"),
-		strings.Contains(msg, "certificate"),
-		strings.Contains(msg, "tls:"),
-		strings.Contains(msg, "handshake"):
-		return errTLS
-	default:
-		return errNet
-	}
-}
-
-func classifyHTTP(status int) errKind {
-	switch {
-	case status == 404:
-		return errHTTP404
-	case status == 403:
-		return errHTTP403
-	case status >= 500:
-		return errHTTP5xx
-	default:
-		return errHTTPOther
-	}
-}
-
-func classifyLocalErr(err error) errKind {
-	switch {
-	case os.IsNotExist(err):
-		return errLocalNoFile
-	case os.IsPermission(err):
-		return errLocalPerm
-	default:
-		return errLocalOther
-	}
-}
-
-func computeVersionStatus() *StatusInfo {
-	rv, rs, kind := fetchRemoteRelease()
-	if kind != errOK {
-		return errorStatus(kind)
-	}
-	lv, ls, kind := readLocalRelease()
-	if kind != errOK {
-		return errorStatus(kind)
-	}
-
-	debugf("versions: local=%q(%s) remote=%q(%s)", lv.raw, ls, rv.raw, rs)
-
-	cmp := lv.compare(rv)
-	mismatch := ls != "" && rs != "" && ls != rs
-
-	switch {
-	case cmp == 0:
-		if mismatch {
-			return readyStatus(annotate(lv.raw, "Modified"), purple)
-		}
-		return readyStatus(annotate(lv.raw, statusDisplay(ls)), white)
-	case cmp < 0:
-		return readyStatus(lv.raw+" → "+annotate(rv.raw, statusDisplay(rs)), white)
-	default:
-		if mismatch {
-			return readyStatus(annotate(lv.raw, "Modified"), purple)
-		}
-		switch ls {
-		case "beta":
-			return readyStatus(annotate(lv.raw, "Beta"), white)
-		case "alpha":
-			return readyStatus(annotate(lv.raw, "Alpha"), white)
-		default:
-			return readyStatus(annotate(lv.raw, "Modified"), purple)
-		}
-	}
-}
-
-func errorStatus(kind errKind) *StatusInfo {
-	text, ok := errTexts[kind]
-	if !ok || text == "" {
-		text = errTexts[errUnknown]
-	}
-	info := &StatusInfo{
-		Text:   text,
-		Target: purple,
-		Runes:  []rune(text),
-	}
-	if debugEnabled() {
-		info.Detail = shortDetail(kind)
-	}
-	return info
-}
-
-func shortDetail(kind errKind) string {
-	switch kind {
-	case errTimeout:
-		return "remote: request timed out"
-	case errDNS:
-		return "remote: host lookup failed"
-	case errRefused:
-		return "remote: connection refused"
-	case errTLS:
-		return "remote: TLS/certificate failed"
-	case errNet:
-		return "remote: network failure"
-	case errHTTP404:
-		return "remote: HTTP 404"
-	case errHTTP403:
-		return "remote: HTTP 403"
-	case errHTTP5xx:
-		return "remote: HTTP 5xx"
-	case errHTTPOther:
-		return "remote: unexpected HTTP status"
-	case errEmpty:
-		return "remote: empty body"
-	case errHTML:
-		return "remote: body is HTML"
-	case errNoKey:
-		return "remote: missing 'latest' key"
-	case errBadValue:
-		return "remote: invalid 'latest' value"
-	case errLocalNoFile:
-		return "local: file not found"
-	case errLocalPerm:
-		return "local: permission denied"
-	case errLocalOther:
-		return "local: read failure"
-	default:
-		return "unknown failure"
-	}
-}
-
-func readyStatus(text string, target RGB) *StatusInfo {
-	return &StatusInfo{
-		Text:   text,
-		Target: target,
-		Runes:  []rune(text),
-	}
-}
-
-func fetchRemoteRelease() (Version, string, errKind) {
-	client := &http.Client{Timeout: versionTimeout}
-	req, err := http.NewRequest(http.MethodGet, versionURL, nil)
-	if err != nil {
-		debugf("remote: new request: %v", err)
-		return Version{}, "", errUnknown
-	}
-	req.Header.Set("User-Agent", "PurpNet/1.0")
-	req.Header.Set("Accept", "text/plain, */*")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		debugf("remote: do: %v", err)
-		return Version{}, "", classifyNetErr(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		debugf("remote: HTTP %d", resp.StatusCode)
-		return Version{}, "", classifyHTTP(resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		debugf("remote: read: %v", err)
-		return Version{}, "", classifyNetErr(err)
-	}
-
-	body := bytes.TrimSpace(data)
-	body = bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
-	if len(body) == 0 {
-		return Version{}, "", errEmpty
-	}
-	if body[0] == '<' {
-		return Version{}, "", errHTML
-	}
-
-	v, kind := parseVersionValue(data, "latest")
-	if kind != errOK {
-		debugf("remote: parse %v; body=%q", kind, bodySnippet(data))
-		return Version{}, "", kind
-	}
-	return v, parseStatusValue(data), errOK
-}
-
-func readLocalRelease() (Version, string, errKind) {
-	home := os.Getenv("HOME")
-	if home == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			debugf("local: home: %v", err)
-			return Version{}, "", errLocalOther
-		}
-		home = h
-	}
-
-	path := filepath.Join(home, "PurpNet", "version.toml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		debugf("local: %v", err)
-		return Version{}, "", classifyLocalErr(err)
-	}
-
-	for _, key := range []string{"local", "version", "latest"} {
-		v, kind := parseVersionValue(data, key)
-		if kind == errOK {
-			return v, parseStatusValue(data), errOK
-		}
-		if kind == errBadValue {
-			return Version{}, "", errBadValue
-		}
-	}
-	return Version{}, "", errNoKey
-}
-
-func parseVersionString(s string) (Version, bool) {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'' || s[0] == '`') && s[len(s)-1] == s[0] {
-		s = s[1 : len(s)-1]
-	}
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return Version{}, false
-	}
-	if s[0] == 'v' || s[0] == 'V' {
-		s = s[1:]
-	}
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return Version{}, false
-	}
-
-	v := Version{raw: s}
-	for _, p := range strings.Split(s, ".") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			return Version{}, false
-		}
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
-			return Version{}, false
-		}
-		v.parts = append(v.parts, n)
-	}
-	if len(v.parts) == 0 {
-		return Version{}, false
-	}
-	return v, true
-}
-
-func parseVersionValue(data []byte, key string) (Version, errKind) {
-	if bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
-		data = data[3:]
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
-			continue
-		}
-
-		i := strings.IndexByte(line, '=')
-		if i < 0 {
-			i = strings.IndexByte(line, ':')
-		}
-		if i < 0 {
-			continue
-		}
-
-		k := strings.TrimSpace(line[:i])
-		k = strings.Trim(k, "\"'")
-		if !strings.EqualFold(k, key) {
-			continue
-		}
-
-		v := strings.TrimSpace(line[i+1:])
-		if j := strings.IndexAny(v, "#;"); j >= 0 {
-			v = strings.TrimSpace(v[:j])
-		}
-
-		if ver, ok := parseVersionString(v); ok {
-			return ver, errOK
-		}
-		return Version{}, errBadValue
-	}
-
-	if key == "latest" {
-		s := strings.TrimSpace(string(data))
-		if ver, ok := parseVersionString(s); ok {
-			return ver, errOK
-		}
-	}
-
-	return Version{}, errNoKey
-}
-
-func parseStatusValue(data []byte) string {
-	if bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
-		data = data[3:]
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
-			continue
-		}
-		i := strings.IndexByte(line, '=')
-		if i < 0 {
-			i = strings.IndexByte(line, ':')
-		}
-		if i < 0 {
-			continue
-		}
-		k := strings.TrimSpace(line[:i])
-		k = strings.Trim(k, "\"'")
-		if !strings.EqualFold(k, "status") {
-			continue
-		}
-		v := strings.TrimSpace(line[i+1:])
-		if j := strings.IndexAny(v, "#;"); j >= 0 {
-			v = strings.TrimSpace(v[:j])
-		}
-		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'' || v[0] == '`') && v[len(v)-1] == v[0] {
-			v = v[1 : len(v)-1]
-		}
-		v = strings.ToLower(strings.TrimSpace(v))
-		switch v {
-		case "release", "beta", "alpha":
-			return v
-		}
-		if v != "" {
-			debugf("status: unrecognized %q, ignoring", v)
-		}
-		return ""
-	}
-	return ""
-}
-
-func statusDisplay(s string) string {
-	switch s {
-	case "release":
-		return "Release"
-	case "beta":
-		return "Beta"
-	case "alpha":
-		return "Alpha"
-	}
-	return ""
-}
-
-func annotate(text, ann string) string {
-	if ann == "" {
-		return text
-	}
-	return text + " • " + ann
-}
-
-func bodySnippet(data []byte) string {
-	var sb strings.Builder
-	for _, r := range string(data) {
-		switch {
-		case r == '\n':
-			sb.WriteString("\\n")
-		case r == '\r':
-			sb.WriteString("\\r")
-		case r == '\t':
-			sb.WriteString("\\t")
-		case r < 0x20 || r == 0x7f:
-			sb.WriteString(fmt.Sprintf("\\x%02x", r))
-		default:
-			sb.WriteRune(r)
-		}
-	}
-	s := strings.TrimSpace(sb.String())
-	rs := []rune(s)
-	if len(rs) > detailMax {
-		rs = append(rs[:detailMax-3], '.', '.', '.')
-	}
-	return string(rs)
-}
-
-func sanitizeDetail(s string) string {
-	var sb strings.Builder
-	for _, r := range s {
-		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			sb.WriteRune(' ')
-		case r < 0x20 || r == 0x7f:
-			sb.WriteRune('?')
-		default:
-			sb.WriteRune(r)
-		}
-	}
-	rs := []rune(sb.String())
-	if len(rs) > detailMax {
-		rs = append(rs[:detailMax-3], '.', '.', '.')
-	}
-	return string(rs)
-}
-
-func queryBgColor() RGB {
-	if !rawOn.Load() {
-		return titleDark
-	}
-
-	out.WriteString("\x1b]11;?\x07\x1b[c")
-
-	deadline := time.Now().Add(bgQueryTimeout)
-	rbuf := make([]byte, 128)
-	var resp []byte
-
-	for time.Now().Before(deadline) && len(resp) < 256 {
-		n, err := syscall.Read(stdinFd, rbuf)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			if err == syscall.EAGAIN {
-				time.Sleep(2 * time.Millisecond)
-				continue
-			}
-			break
-		}
-		if n > 0 {
-			resp = append(resp, rbuf[:n]...)
-			if daDone(resp) {
-				break
-			}
-		}
-	}
-
-	if c, ok := parseOSC11(resp); ok {
-		return c
-	}
-	return titleDark
-}
-
-func daDone(resp []byte) bool {
-	i := bytes.LastIndex(resp, []byte("\x1b[?"))
-	return i >= 0 && bytes.IndexByte(resp[i:], 'c') >= 0
-}
-
-func parseOSC11(resp []byte) (RGB, bool) {
-	idx := bytes.Index(resp, []byte("rgb:"))
-	if idx < 0 {
-		return RGB{}, false
-	}
-
-	rest := resp[idx+4:]
-	end := bytes.IndexAny(rest, "\x07\x1b")
-	if end < 0 {
-		end = len(rest)
-	}
-
-	parts := strings.Split(string(rest[:end]), "/")
-	if len(parts) < 3 {
-		return RGB{}, false
-	}
-
-	var c RGB
-	for i := 0; i < 3; i++ {
-		h := strings.TrimSpace(parts[i])
-		if h == "" || len(h) > 4 {
-			return RGB{}, false
-		}
-		v, err := strconv.ParseUint(h, 16, 32)
-		if err != nil {
-			return RGB{}, false
-		}
-		var maxV uint64
-		switch len(h) {
-		case 1:
-			maxV = 0xF
-		case 2:
-			maxV = 0xFF
-		case 3:
-			maxV = 0xFFF
-		case 4:
-			maxV = 0xFFFF
-		}
-		c[i] = int(v * 255 / maxV)
-	}
-	return c, true
-}
-
-func clamp01(v float64) float64 { return math.Max(0, math.Min(1, v)) }
 
 func smootherstep(x float64) float64 {
 	x = clamp01(x)
 	return x * x * x * (x*(x*6-15) + 10)
-}
-
-func toVec(c RGB) Vec { return Vec{lin[c[0]], lin[c[1]], lin[c[2]]} }
-
-func toRGB(v Vec) RGB {
-	var o RGB
-	for i := range o {
-		o[i] = int(math.Round(255.0 * math.Pow(clamp01(v[i]), 1.0/2.2)))
-	}
-	return o
 }
 
 func mix(a, b RGB, k float64) RGB {
@@ -776,53 +152,61 @@ func mix(a, b RGB, k float64) RGB {
 	if k >= 1 {
 		return b
 	}
-	va, vb := toVec(a), toVec(b)
-	var v Vec
-	for i := range v {
-		v[i] = va[i] + (vb[i]-va[i])*k
+	var o RGB
+	for i := range o {
+		la, lb := lin[a[i]], lin[b[i]]
+		o[i] = int(math.Round(255 * math.Pow(clamp01(la+(lb-la)*k), 1/2.2)))
 	}
-	return toRGB(v)
+	return o
 }
 
 func stopsAt(stops []RGB, t float64) RGB {
 	t = clamp01(t) * float64(len(stops)-1)
-	i := int(t)
-	if i > len(stops)-2 {
-		i = len(stops) - 2
-	}
+	i := min(int(t), len(stops)-2)
 	return mix(stops[i], stops[i+1], t-float64(i))
 }
 
-func sweepT(x, r int) float64 {
-	wd := float64(logo.w - 1)
-	if wd < 1 {
-		wd = 1
-	}
-	hd := float64(logo.h - 1)
-	if hd < 1 {
-		hd = 1
-	}
-	return clamp01((float64(x)/wd + float64(r)/hd) / 2)
+func diag(x, y int, wx float64) float64 {
+	return clamp01(wx*float64(x)/float64(max(logo.w-1, 1)) + (1-wx)*float64(y)/float64(max(logo.h-1, 1)))
 }
 
-func gradT(x, r int) float64 {
-	wd := float64(logo.w - 1)
-	if wd < 1 {
-		wd = 1
-	}
-	hd := float64(logo.h - 1)
-	if hd < 1 {
-		hd = 1
-	}
-	return clamp01(0.8*float64(x)/wd + 0.2*float64(r)/hd)
+func jitter(x, y int) float64 {
+	v := math.Sin(float64(x)*12.9898+float64(y)*78.233) * 43758.5453
+	return v - math.Floor(v)
 }
 
-func grad(stops []RGB, x, r int) RGB {
-	return stopsAt(stops, gradT(x, r))
+type Renderer struct {
+	grid  [][]Cell
+	buf   []byte
+	bg    RGB
+	plain bool
 }
 
-func cellColor(c *Cell, t float64) (RGB, bool) {
-	k := smootherstep((t - c.start*appearLag) / appearDur)
+func newRenderer() *Renderer {
+	r := &Renderer{bg: titleDark, grid: make([][]Cell, logo.h)}
+	for y, row := range logo.rows {
+		r.grid[y] = make([]Cell, logo.w)
+		for x, ch := range row {
+			c := Cell{ch: ch}
+			if ch != ' ' {
+				c.gray = stopsAt(gray, diag(x, y, 0.8))
+				c.target = stopsAt(color, diag(x, y, 0.8))
+				c.start = diag(x, y, 0.5)*sweepSpread + sweepJitter*jitter(x, y)
+			}
+			r.grid[y][x] = c
+		}
+	}
+	return r
+}
+
+func (r Renderer) cell(c Cell, t float64) (RGB, bool) {
+	if c.ch == ' ' {
+		return RGB{}, false
+	}
+	// ВАЖНО: старый эффект — `c.start * appearLag`, а не `c.start + appearLag`.
+	// Иначе клетки начинают перекрашиваться до того, как проявились серыми,
+	// и эффект "сначала серый градиент, потом плавная перекраска" ломается.
+	k := smoothstep((t - appearLag) / appearDur)
 	if k <= 0 {
 		return RGB{}, false
 	}
@@ -830,423 +214,296 @@ func cellColor(c *Cell, t float64) (RGB, bool) {
 	if s >= 1 {
 		return c.target, true
 	}
-	o := mix(mix(titleDark, c.gray, k), c.target, s)
+	o := mix(mix(r.bg, c.gray, k), c.target, s)
 	if g := math.Sin(math.Pi * s); g > 0 {
-		o = mix(o, glowColor, glowAmount*g)
+		o = mix(o, glow, glowAmount*g)
 	}
 	return o, true
 }
 
-func titleColor(i int, t float64) (RGB, bool) {
+func (r Renderer) titleColor(i int, t float64) (RGB, bool) {
+	u := (t - titleDelay - float64(i)*titleStep) / titleFade
+	if u <= 0 {
+		return RGB{}, false
+	}
+	k := smoothstep(u)
+	pos := float64(i) / float64(max(len(titleRunes)-1, 1))
+	end := stopsAt(color, pos)
+	if k >= 1 {
+		return end, true
+	}
+	return mix(r.bg, end, k), true
+}
+
+func (r Renderer) versionColor(i int, t float64) (RGB, bool) {
 	u := (t - titleDelay - float64(i)*titleStep) / titleFade
 	if u <= 0 {
 		return RGB{}, false
 	}
 	k := smootherstep(u)
 	if k >= 1 {
-		return color[0], true
+		return gray[0], true
 	}
-	return mix(titleDark, color[0], k), true
-}
-
-func statusColorAt(elapsed float64, i int, target RGB) (RGB, bool) {
-	u := (elapsed - float64(i)*titleStep) / titleFade
-	if u <= 0 {
-		return RGB{}, false
+	if k < titleMid {
+		return mix(r.bg, gray[1], k/titleMid), true
 	}
-	k := smootherstep(u)
-	if k >= 1 {
-		return target, true
-	}
-	return mix(titleDark, target, k), true
-}
-
-func checkingColor(t float64) (RGB, bool) {
-	u := t / checkingFade
-	if u <= 0 {
-		return RGB{}, false
-	}
-	k := smootherstep(u)
-	if k >= 1 {
-		return dimColor, true
-	}
-	return mix(titleDark, dimColor, k), true
+	return mix(gray[1], gray[0], (k-titleMid)/(1-titleMid)), true
 }
 
 func appendFG(b []byte, c RGB) []byte {
-	b = append(b, "\x1b[38;2;"...)
-	b = strconv.AppendInt(b, int64(c[0]), 10)
-	b = append(b, ';')
-	b = strconv.AppendInt(b, int64(c[1]), 10)
-	b = append(b, ';')
-	b = strconv.AppendInt(b, int64(c[2]), 10)
-	return append(b, 'm')
+	return fmt.Appendf(b, "\x1b[38;2;%d;%d;%dm", c[0], c[1], c[2])
 }
 
-func frame(t float64) []byte {
-	b := buf[:0]
-	b = append(b, "\x1b[?2026h"...)
-	if printed {
-		b = append(b, "\x1b["...)
-		b = strconv.AppendInt(b, int64(logo.h+1), 10)
-		b = append(b, "A\r"...)
+func (r *Renderer) esc(b []byte, s string) []byte {
+	if r.plain {
+		return b
 	}
-
-	info := currentStatus.Load()
-
-	for r := 0; r < logo.h; r++ {
-		var last RGB
-		have := false
-
-		for i := range grid[r] {
-			c := &grid[r][i]
-			if c.ch == ' ' {
-				b = append(b, ' ')
-				continue
-			}
-			col, ok := cellColor(c, t)
-			if !ok {
-				b = append(b, ' ')
-				continue
-			}
-			if !have || col != last {
-				b = appendFG(b, col)
-				last, have = col, true
-			}
-			b = utf8.AppendRune(b, c.ch)
-		}
-		b = append(b, "\x1b[m"...)
-
-		if r == titleRow {
-			for g := 0; g < titleGap; g++ {
-				b = append(b, ' ')
-			}
-			have = false
-			for i, ch := range titleRunes {
-				col, ok := titleColor(i, t)
-				if !ok {
-					b = append(b, ' ')
-					continue
-				}
-				if !have || col != last {
-					b = appendFG(b, col)
-					last, have = col, true
-				}
-				b = utf8.AppendRune(b, ch)
-			}
-			b = append(b, "\x1b[m"...)
-		}
-
-		if r == statusRow {
-			for g := 0; g < statusGap; g++ {
-				b = append(b, ' ')
-			}
-			if info != nil {
-				have = false
-				elapsed := time.Since(info.ReadyAt).Seconds()
-				for i, ch := range info.Runes {
-					col, ok := statusColorAt(elapsed, i, info.Target)
-					if !ok {
-						b = append(b, ' ')
-						continue
-					}
-					if !have || col != last {
-						b = appendFG(b, col)
-						last, have = col, true
-					}
-					b = utf8.AppendRune(b, ch)
-				}
-				b = append(b, "\x1b[m"...)
-			}
-		}
-
-		b = append(b, "\x1b[K\n"...)
-	}
-
-	if info != nil && info.Detail != "" {
-		b = append(b, "\x1b[38;2;140;140;140m"...)
-		b = append(b, sanitizeDetail(info.Detail)...)
-		b = append(b, "\x1b[m"...)
-	}
-	b = append(b, "\x1b[K\n"...)
-
-	b = append(b, "\x1b[?2026l"...)
-	buf = b
-	return b
+	return append(b, s...)
 }
 
-func plainFrame() []byte {
-	info := currentStatus.Load()
-	var b []byte
-	for r := 0; r < logo.h; r++ {
-		rs := logo.rows[r]
-		b = append(b, string(rs)...)
-		for i := len(rs); i < logo.w; i++ {
+func (r *Renderer) eol(b []byte) []byte { return append(r.esc(b, "\x1b[K"), '\n') }
+
+func (r *Renderer) paint(b []byte, n int, at func(i int) (rune, RGB, bool)) []byte {
+	var last RGB
+	have := false
+	for i := 0; i < n; i++ {
+		ch, col, ok := at(i)
+		if !ok {
 			b = append(b, ' ')
+			continue
 		}
-		if r == titleRow {
+		if !r.plain && (!have || col != last) {
+			b = appendFG(b, col)
+			last, have = col, true
+		}
+		b = utf8.AppendRune(b, ch)
+	}
+	return r.esc(b, "\x1b[m")
+}
+
+func (r *Renderer) frame(t float64, up int) []byte {
+	b := r.buf[:0]
+	if r.plain {
+		t = 1e9
+	} else {
+		b = append(b, "\x1b[?2026h"...)
+		if up > 0 {
+			b = fmt.Appendf(b, "\x1b[%dA\r", up)
+		}
+	}
+	for y, row := range r.grid {
+		b = r.paint(b, len(row), func(i int) (rune, RGB, bool) {
+			col, ok := r.cell(row[i], t)
+			return row[i].ch, col, ok
+		})
+		if y == titleRow {
 			b = append(b, strings.Repeat(" ", titleGap)...)
-			b = append(b, titleText...)
+			b = r.paint(b, len(titleRunes), func(i int) (rune, RGB, bool) {
+				col, ok := r.titleColor(i, t)
+				return titleRunes[i], col, ok
+			})
 		}
-		if r == statusRow && info != nil {
-			b = append(b, strings.Repeat(" ", statusGap)...)
-			b = append(b, info.Text...)
+		if y == versionRow && len(versionRunes) > 0 {
+			b = append(b, strings.Repeat(" ", titleGap)...)
+			b = r.paint(b, len(versionRunes), func(i int) (rune, RGB, bool) {
+				col, ok := r.versionColor(i, t)
+				return versionRunes[i], col, ok
+			})
 		}
-		b = append(b, '\n')
+		b = r.eol(b)
 	}
-	if info != nil && info.Detail != "" {
-		b = append(b, sanitizeDetail(info.Detail)...)
-		b = append(b, '\n')
-	}
+	b = r.esc(b, "\x1b[?2026l")
+	r.buf = b
 	return b
 }
 
-func shouldEnd(t float64) bool {
-	info := currentStatus.Load()
-	if info == nil {
-		if t < baseEnd {
-			return false
-		}
-		return t >= versionTimeout.Seconds()+titleDelay+titleFade+settle
-	}
-	readyT := info.ReadyAt.Sub(animStart).Seconds()
-	if readyT < 0 {
-		readyT = 0
-	}
-	chars := len(info.Runes)
-	if chars < 1 {
-		chars = 1
-	}
-	statusDur := float64(chars-1)*titleStep + titleFade
-	end := math.Max(baseEnd, readyT+statusDur) + settle
-	return t >= end
+type Terminal struct {
+	fd   int
+	orig syscall.Termios
+	raw  bool
+	keys bool
 }
 
 func ioctl(fd int, req uintptr, t *syscall.Termios) bool {
-	_, _, e := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		req,
-		uintptr(unsafe.Pointer(t)),
-	)
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(unsafe.Pointer(t)))
 	return e == 0
 }
 
 func isTTY(fd int) bool {
 	var t syscall.Termios
-	return ioctl(fd, ioctlGet, &t)
+	return ioctl(fd, syscall.TCGETS, &t)
 }
 
-func flushInput() {
-	if rawOn.Load() {
-		syscall.Syscall(
-			syscall.SYS_IOCTL,
-			uintptr(stdinFd),
-			uintptr(ioctlFlush),
-			0,
-		)
-	}
-}
-
-func enableISIG() {
-	var t syscall.Termios
-	if ioctl(stdinFd, ioctlGet, &t) {
-		t.Lflag |= syscall.ISIG
-		ioctl(stdinFd, ioctlSet, &t)
-	}
-}
-
-func restoreTerminal() {
-	restoreOnce.Do(func() {
-		if rawOn.Load() {
-			t := origTerm
-			ioctl(stdinFd, ioctlSetFl, &t)
-			rawOn.Store(false)
-		}
-		out.WriteString("\x1b[?2026l\x1b[?7h\x1b[?2004h\x1b[?25h\x1b[m")
-	})
-}
-
-func enableRaw() {
-	if rawOn.Load() {
+func (t *Terminal) enterRaw() {
+	if !ioctl(t.fd, syscall.TCGETS, &t.orig) {
 		return
 	}
-	var t syscall.Termios
-	if !ioctl(stdinFd, ioctlGet, &t) {
-		return
-	}
-	origTerm = t
-	t.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
-	t.Iflag &^= syscall.IXON | syscall.ICRNL
-	t.Cc[syscall.VMIN] = 0
-	t.Cc[syscall.VTIME] = 1
-	if ioctl(stdinFd, ioctlSet, &t) {
-		rawOn.Store(true)
-		flushInput()
+	s := t.orig
+	s.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	s.Iflag &^= syscall.IXON | syscall.ICRNL
+	s.Cc[syscall.VMIN], s.Cc[syscall.VTIME] = 0, 0
+	if t.raw = ioctl(t.fd, syscall.TCSETS, &s); t.raw {
+		t.keys = true
+		t.flush()
 	}
 }
 
-func lockInput() {
-	out.WriteString("\x1b[?25l\x1b[?2004l\x1b[?7l")
-	enableRaw()
-	if rawOn.Load() {
-		readerStop = make(chan struct{})
-		readerDone = make(chan struct{})
-		go readKeys(readerStop, readerDone)
+func (t *Terminal) flush() {
+	if t.raw {
+		syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), tcflsh, 0)
 	}
 }
 
-func unlockInput() {
-	unlockOnce.Do(func() {
-		if readerStop != nil {
-			close(readerStop)
-		}
-		if readerDone != nil {
-			<-readerDone
-		}
-		flushInput()
-		restoreTerminal()
-
-		mu.Lock()
-		unlocked = true
-		mu.Unlock()
-	})
-}
-
-func stopSoft() {
-	stopOnce.Do(func() {
-		mu.Lock()
-		if printed && !unlocked {
-			out.WriteString("\x1b[" + strconv.Itoa(logo.h+1) + "A\r\x1b[J")
-		}
-
-		flushInput()
-		restoreTerminal()
-		os.Exit(0)
-	})
-}
-
-func readKeys(stop <-chan struct{}, done chan<- struct{}) {
-	defer close(done)
-	rbuf := make([]byte, 128)
+func (t *Terminal) read(p []byte) int {
 	for {
-		select {
-		case <-stop:
-			return
+		n, err := syscall.Read(t.fd, p)
+		switch err {
+		case nil:
+			return n
+		case syscall.EINTR:
+		case syscall.EAGAIN:
+			return 0
 		default:
+			return -1
 		}
-		n, err := syscall.Read(stdinFd, rbuf)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			if err == syscall.EAGAIN {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			enableISIG()
-			return
+	}
+}
+
+func daDone(resp []byte) bool {
+	i := bytes.LastIndex(resp, []byte("\x1b[?"))
+	return i >= 0 && bytes.IndexByte(resp[i:], 'c') >= 0
+}
+
+func parseOSC11(resp []byte) (RGB, bool) {
+	_, rest, ok := strings.Cut(string(resp), "rgb:")
+	if !ok {
+		return RGB{}, false
+	}
+	if i := strings.IndexAny(rest, "\x07\x1b"); i >= 0 {
+		rest = rest[:i]
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 3 {
+		return RGB{}, false
+	}
+	var c RGB
+	for i := range c {
+		h := strings.TrimSpace(parts[i])
+		v, err := strconv.ParseUint(h, 16, 32)
+		if err != nil || len(h) > 4 {
+			return RGB{}, false
 		}
-		if n <= 0 {
-			time.Sleep(10 * time.Millisecond)
-			continue
+		c[i] = int(v * 255 / (uint64(1)<<(4*len(h)) - 1))
+	}
+	return c, true
+}
+
+func (t *Terminal) queryBg(def RGB) RGB {
+	out.WriteString("\x1b]11;?\x07\x1b[c")
+	var resp []byte
+	buf := make([]byte, 128)
+	for end := time.Now().Add(bgQueryTimeout); time.Now().Before(end) && len(resp) < 256 && !daDone(resp); {
+		n := t.read(buf)
+		if n < 0 {
+			break
 		}
-		for _, c := range rbuf[:n] {
-			if c == 3 || c == 4 || c == 28 {
-				stopSoft()
-				return
+		if n == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		resp = append(resp, buf[:n]...)
+	}
+	if c, ok := parseOSC11(resp); ok {
+		return c
+	}
+	return def
+}
+
+func (t *Terminal) start() { out.WriteString("\x1b[?25l\x1b[?2004l\x1b[?7l") }
+
+func (t *Terminal) pollKey(buf []byte) int {
+	for t.keys {
+		n := t.read(buf)
+		if n < 0 {
+			t.keys = false
+			t.enableISIG()
+			break
+		}
+		if n == 0 {
+			break
+		}
+		for _, c := range buf[:n] {
+			if code, ok := exitKeys[c]; ok {
+				return code
 			}
 		}
 	}
+	return -1
+}
+
+func (t *Terminal) enableISIG() {
+	var s syscall.Termios
+	if ioctl(t.fd, syscall.TCGETS, &s) {
+		s.Lflag |= syscall.ISIG
+		ioctl(t.fd, syscall.TCSETS, &s)
+	}
+}
+
+func (t *Terminal) restore() {
+	if t.raw {
+		ioctl(t.fd, tcsetsf, &t.orig)
+	}
+	out.WriteString("\x1b[?2026l\x1b[?7h\x1b[?2004h\x1b[?25h\x1b[m")
+}
+
+func (t *Terminal) abort(code, lines int) {
+	if lines > 0 {
+		fmt.Fprintf(out, "\x1b[%dA\r\x1b[J", lines)
+	}
+	t.restore()
+	os.Exit(code)
 }
 
 func main() {
 	if !isTTY(1) || os.Getenv("TERM") == "dumb" {
 		return
 	}
-
-	statusCh := make(chan *StatusInfo, 1)
-	go func() {
-		statusCh <- computeVersionStatus()
-	}()
-
+	r := newRenderer()
 	if _, ok := os.LookupEnv("NO_COLOR"); ok {
-		info := <-statusCh
-		info.ReadyAt = time.Now()
-		currentStatus.Store(info)
-		out.Write(plainFrame())
+		r.plain = true
+		out.Write(r.frame(0, 0))
 		return
 	}
-
-	defer restoreTerminal()
-	defer func() {
-		if r := recover(); r != nil {
-			restoreTerminal()
-			panic(r)
-		}
-	}()
-
+	term := &Terminal{fd: int(os.Stdin.Fd())}
+	defer term.restore()
 	sig := make(chan os.Signal, 1)
-	sigDone := make(chan struct{})
-
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
-
-	go func() {
-		select {
-		case <-sig:
-			stopSoft()
-		case <-sigDone:
-			return
-		}
-	}()
-
-	enableRaw()
-	if rawOn.Load() {
-		titleDark = queryBgColor()
-		flushInput()
+	term.enterRaw()
+	if term.raw {
+		r.bg = term.queryBg(titleDark)
+		term.flush()
 	}
-
-	lockInput()
-
-	ticker := time.NewTicker(time.Second / fps)
-	defer ticker.Stop()
-
-	animStart = time.Now()
-	statusStart := animStart.Add(time.Duration(titleDelay * float64(time.Second)))
-
+	term.start()
+	tick := time.NewTicker(time.Second / fps)
+	defer tick.Stop()
+	start := time.Now()
+	keys := make([]byte, 128)
+	lines := 0
 	for {
-		t := time.Since(animStart).Seconds()
-
+		t := time.Since(start).Seconds()
+		code := term.pollKey(keys)
 		select {
-		case info := <-statusCh:
-			info.ReadyAt = time.Now()
-			if info.ReadyAt.Before(statusStart) {
-				info.ReadyAt = statusStart
-			}
-			currentStatus.Store(info)
+		case s := <-sig:
+			code = 128 + int(s.(syscall.Signal))
 		default:
 		}
-
-		mu.Lock()
-		out.Write(frame(t))
-		printed = true
-		mu.Unlock()
-
-		if shouldEnd(t) {
-			break
+		if code >= 0 {
+			term.abort(code, lines)
 		}
-
-		<-ticker.C
+		out.Write(r.frame(t, lines))
+		lines = logo.h
+		if t >= baseEnd {
+			return
+		}
+		<-tick.C
 	}
-
-	unlockInput()
-
-	signal.Stop(sig)
-
-	select {
-	case <-sig:
-	default:
-	}
-
-	close(sigDone)
 }
