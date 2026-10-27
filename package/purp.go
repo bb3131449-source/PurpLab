@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -82,39 +83,94 @@ func init() {
 	glow = mix(white, color[0], glowTint)
 }
 
-func loadVersion() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+func versionPaths() []string {
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), "version.toml"))
 	}
-	data, err := os.ReadFile(filepath.Join(home, "PurpNet", "version.toml"))
-	if err != nil {
-		return ""
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, "PurpNet", "version.toml"))
 	}
+	if wd, err := os.Getwd(); err == nil {
+		paths = append(paths, filepath.Join(wd, "version.toml"))
+	}
+	return paths
+}
+
+func tomlValue(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') {
+		if i := strings.IndexByte(s[1:], s[0]); i >= 0 {
+			return s[1 : 1+i]
+		}
+	}
+	if i := strings.Index(s, " #"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if i := strings.Index(s, "\t#"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+func parseVersion(data []byte) (string, error) {
 	var v, st string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		k, val, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
-		k = strings.TrimSpace(k)
-		val = strings.Trim(strings.TrimSpace(val), `"'`)
-		switch k {
+		switch strings.TrimSpace(k) {
 		case "version":
-			v = val
+			v = tomlValue(val)
 		case "status":
-			st = val
+			st = tomlValue(val)
 		}
 	}
 	if v == "" {
-		return ""
+		return "", fmt.Errorf("missing version key")
 	}
 	if st == "" {
-		return v
+		return v, nil
 	}
-	st = strings.ToUpper(st[:1]) + st[1:]
-	return v + " • " + st
+	if r := []rune(st); len(r) > 0 {
+		r[0] = unicode.ToUpper(r[0])
+		st = string(r)
+	}
+	return v + " • " + st, nil
+}
+
+func loadVersion() string {
+	debug := os.Getenv("PURP_DEBUG") != ""
+	paths := versionPaths()
+	var lastErr error
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if debug && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "purp: version: %v\n", err)
+			}
+			lastErr = err
+			continue
+		}
+		text, err := parseVersion(data)
+		if err != nil {
+			if debug {
+				fmt.Fprintf(os.Stderr, "purp: %s: %v\n", path, err)
+			}
+			lastErr = err
+			continue
+		}
+		return text
+	}
+	if debug && lastErr != nil {
+		fmt.Fprintf(os.Stderr, "purp: version.toml not found (tried: %s)\n", strings.Join(paths, ", "))
+	}
+	return ""
 }
 
 func newLogo(src ...string) Logo {
