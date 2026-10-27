@@ -33,5 +33,5 @@ go.work.sum
 # .vscode/
 
 # PurpNet
-package/logo
+package/purp
 *.bak
