@@ -1,0 +1,338 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Repo struct {
+	Name string
+	URL  string
+}
+
+const (
+	httpUA       = "purpnet/1"
+	maxToolBytes = 1 << 20
+	httpTimeout  = 10 * time.Second
+)
+
+var httpClient = &http.Client{Timeout: httpTimeout}
+var repos []Repo
+
+func purpRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "PurpNet")
+}
+
+func reposPath() string {
+	root := purpRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "repos.toml")
+}
+
+func cacheRoot() string {
+	root := purpRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "cache")
+}
+
+func repoCacheDir(repo Repo) string {
+	root := cacheRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, safeName(repo.Name))
+}
+
+func safeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "repo"
+	}
+	return b.String()
+}
+
+func validID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func LoadRepos() []Repo {
+	path := reposPath()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []Repo
+	var cur *Repo
+	flush := func() {
+		if cur != nil && (cur.Name != "" || cur.URL != "") {
+			if cur.Name == "" {
+				cur.Name = cur.URL
+			}
+			out = append(out, *cur)
+		}
+		cur = nil
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line == "[[repo]]" {
+			flush()
+			cur = &Repo{}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		switch strings.TrimSpace(k) {
+		case "name":
+			cur.Name = v
+		case "url":
+			cur.URL = v
+		}
+	}
+	flush()
+	return out
+}
+
+func httpGet(url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", httpUA)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxToolBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxToolBytes {
+		return nil, fmt.Errorf("file too large (>%d bytes)", maxToolBytes)
+	}
+	return data, nil
+}
+
+func manifestURL(repo Repo) string {
+	return strings.TrimRight(repo.URL, "/") + "/manifest.txt"
+}
+
+func fetchManifest(repo Repo) ([]string, error) {
+	data, err := httpGet(manifestURL(repo))
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !validID(line) {
+			continue
+		}
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		ids = append(ids, line)
+	}
+	return ids, nil
+}
+
+var (
+	curRepo   int
+	curTool   int
+	catItems  []string
+	catLoaded bool
+	catErr    string
+)
+
+func InitCatalog() {
+	repos = LoadRepos()
+	curRepo = 0
+	curTool = 0
+	catItems = nil
+	catLoaded = false
+	catErr = ""
+}
+
+func reloadCatalog() {
+	repos = LoadRepos()
+	if curRepo >= len(repos) {
+		curRepo = max(0, len(repos)-1)
+	}
+	catLoaded = false
+}
+
+func refreshTools() {
+	catItems = nil
+	catErr = ""
+	if len(repos) == 0 || curRepo < 0 || curRepo >= len(repos) {
+		return
+	}
+	ids, err := fetchManifest(repos[curRepo])
+	if err != nil {
+		catErr = err.Error()
+		return
+	}
+	catItems = ids
+}
+
+func ensureLoaded() {
+	if !catLoaded {
+		refreshTools()
+		catLoaded = true
+	}
+}
+
+func writeColored(b []byte, s string, col RGB) []byte {
+	b = appendFG(b, col)
+	return append(b, s...)
+}
+
+func RenderCatalog(b []byte, baseY int) []byte {
+	ensureLoaded()
+	y := baseY
+
+	b = fmt.Appendf(b, "\x1b[%d;1H  ", y)
+	if len(repos) == 0 {
+		b = writeColored(b, "(no repos)", theme.HintSep)
+		b = append(b, "\x1b[m\x1b[K"...)
+		return b
+	}
+	for i, r := range repos {
+		if i > 0 {
+			b = writeColored(b, " • ", theme.HintSep)
+		}
+		if i == curRepo {
+			b = writeColored(b, r.Name, theme.White)
+		} else {
+			b = writeColored(b, r.Name, theme.TitleStart)
+		}
+	}
+	b = append(b, "\x1b[m\x1b[K"...)
+	y++
+
+	b = fmt.Appendf(b, "\x1b[%d;1H\x1b[K", y)
+	y++
+
+	if catErr != "" {
+		b = fmt.Appendf(b, "\x1b[%d;1H  ", y)
+		b = writeColored(b, "(fetch failed: "+catErr+")", theme.HintSep)
+		b = append(b, "\x1b[m\x1b[K"...)
+		return b
+	}
+	if len(catItems) == 0 {
+		b = fmt.Appendf(b, "\x1b[%d;1H  ", y)
+		b = writeColored(b, "(no tools)", theme.HintSep)
+		b = append(b, "\x1b[m\x1b[K"...)
+		return b
+	}
+
+	numW := max(2, len(strconv.Itoa(len(catItems))))
+	for i, id := range catItems {
+		b = fmt.Appendf(b, "\x1b[%d;1H  ", y+i)
+		num := fmt.Sprintf("%0*d", numW, i+1)
+		if i == curTool {
+			b = writeColored(b, num+" "+id, theme.White)
+		} else {
+			b = writeColored(b, num, theme.NumberColor)
+			b = append(b, ' ')
+			b = writeColored(b, id, theme.TitleStart)
+		}
+		b = append(b, "\x1b[m\x1b[K"...)
+	}
+	return b
+}
+
+func HandleCatalogKey(code int) (consumed bool, newMode int) {
+	switch code {
+	case keyEsc:
+		return true, modeSystem
+	case keyLeft:
+		if len(repos) > 0 {
+			curRepo = (curRepo - 1 + len(repos)) % len(repos)
+			curTool = 0
+			catLoaded = false
+		}
+		return true, modeCatalog
+	case keyRight:
+		if len(repos) > 0 {
+			curRepo = (curRepo + 1) % len(repos)
+			curTool = 0
+			catLoaded = false
+		}
+		return true, modeCatalog
+	case keyDown:
+		if len(catItems) > 0 {
+			curTool = min(curTool+1, len(catItems)-1)
+		}
+		return true, modeCatalog
+	case keyUp:
+		if len(catItems) > 0 {
+			curTool = max(curTool-1, 0)
+		}
+		return true, modeCatalog
+	case keyEnter:
+		return true, modeCatalog
+	}
+	return false, 0
+}
+
+func HintCatalog() []hintSeg {
+	return []hintSeg{
+		{"⇅⇄", "Navigation"},
+		{"↵", "Open"},
+		{"Esc", "Back"},
+		{"q", "Quit"},
+	}
+}

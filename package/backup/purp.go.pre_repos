@@ -1,0 +1,2058 @@
+package main
+
+// fix15: no ShowAnim (always animate), version.toml -> purpnet.toml
+
+// fix13: no \n in TUI, absolute positioning
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+	"unicode"
+	"unicode/utf8"
+	"unsafe"
+)
+
+type RGB [3]int
+
+type Cell struct {
+	ch           rune
+	gray, target RGB
+	start        float64
+}
+
+type Logo struct {
+	rows [][]rune
+	w, h int
+}
+
+// ─────────────────────── ThemeColors ───────────────────────
+
+type ThemeColors struct {
+	White       RGB
+	TitleDark   RGB
+	FrameBorder RGB
+	NumberColor RGB
+	LogoStart   RGB
+	LogoEnd     RGB
+	TitleStart  RGB
+	TitleEnd    RGB
+	BannerStart RGB
+	BannerMid   RGB
+	BannerEnd   RGB
+	HintKey     RGB
+	HintLabel   RGB
+	HintSep     RGB
+	GlowTint    float64
+
+	StatusInterrupted int
+	StatusBuildFailed int
+	StatusExitFailed  int
+	StatusSuccess     int
+	StatusBuilding    int
+}
+
+func defaultTheme() ThemeColors {
+	return ThemeColors{
+		White:             RGB{255, 255, 255},
+		TitleDark:         RGB{14, 12, 20},
+		FrameBorder:       RGB{200, 200, 220},
+		NumberColor:       RGB{205, 210, 220},
+		LogoStart:         RGB{225, 225, 225},
+		LogoEnd:           RGB{140, 140, 140},
+		TitleStart:        RGB{170, 170, 255},
+		TitleEnd:          RGB{138, 112, 238},
+		BannerStart:       RGB{228, 218, 255},
+		BannerMid:         RGB{170, 170, 255},
+		BannerEnd:         RGB{138, 112, 238},
+		HintKey:           RGB{210, 214, 224},
+		HintLabel:         RGB{210, 214, 224},
+		HintSep:           RGB{120, 124, 138},
+		GlowTint:          0.3,
+		StatusInterrupted: 33,
+		StatusBuildFailed: 31,
+		StatusExitFailed:  31,
+		StatusSuccess:     32,
+		StatusBuilding:    2,
+	}
+}
+
+func colorsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "PurpNet", "colors.toml")
+}
+
+var theme = loadColors()
+
+var (
+	ansiStatusInterrupted = theme.StatusInterrupted
+	ansiStatusBuildFailed = theme.StatusBuildFailed
+	ansiStatusExitFailed  = theme.StatusExitFailed
+	ansiStatusSuccess     = theme.StatusSuccess
+	ansiStatusBuilding    = theme.StatusBuilding
+)
+
+func loadColors() ThemeColors {
+	t := defaultTheme()
+	path := colorsPath()
+	if path == "" {
+		return t
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return t
+	}
+	section := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		applyColor(&t, section, strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	return t
+}
+
+func parseRGB(s string) (RGB, bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return RGB{}, false
+	}
+	parts := strings.Split(s[1:len(s)-1], ",")
+	if len(parts) != 3 {
+		return RGB{}, false
+	}
+	var c RGB
+	for i, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return RGB{}, false
+		}
+		c[i] = max(0, min(255, n))
+	}
+	return c, true
+}
+
+func ansiCode(name string) int {
+	switch strings.ToLower(name) {
+	case "black":
+		return 30
+	case "red":
+		return 31
+	case "green":
+		return 32
+	case "yellow":
+		return 33
+	case "blue":
+		return 34
+	case "magenta":
+		return 35
+	case "cyan":
+		return 36
+	case "white":
+		return 37
+	case "bright_black":
+		return 90
+	case "bright_red":
+		return 91
+	case "bright_green":
+		return 92
+	case "bright_yellow":
+		return 93
+	case "bright_blue":
+		return 94
+	case "bright_magenta":
+		return 95
+	case "bright_cyan":
+		return 96
+	case "bright_white":
+		return 97
+	case "dim":
+		return 2
+	case "bold":
+		return 1
+	case "reset":
+		return 0
+	}
+	return 0
+}
+
+func applyColor(t *ThemeColors, section, key, val string) {
+	switch section {
+	case "base":
+		switch key {
+		case "white":
+			if c, ok := parseRGB(val); ok {
+				t.White = c
+			}
+		case "title_dark":
+			if c, ok := parseRGB(val); ok {
+				t.TitleDark = c
+			}
+		}
+	case "frame":
+		if key == "border" {
+			if c, ok := parseRGB(val); ok {
+				t.FrameBorder = c
+			}
+		}
+	case "numbers":
+		if key == "fg" {
+			if c, ok := parseRGB(val); ok {
+				t.NumberColor = c
+			}
+		}
+	case "logo":
+		switch key {
+		case "start":
+			if c, ok := parseRGB(val); ok {
+				t.LogoStart = c
+			}
+		case "end":
+			if c, ok := parseRGB(val); ok {
+				t.LogoEnd = c
+			}
+		}
+	case "title":
+		switch key {
+		case "start":
+			if c, ok := parseRGB(val); ok {
+				t.TitleStart = c
+			}
+		case "end":
+			if c, ok := parseRGB(val); ok {
+				t.TitleEnd = c
+			}
+		}
+	case "banner":
+		switch key {
+		case "start":
+			if c, ok := parseRGB(val); ok {
+				t.BannerStart = c
+			}
+		case "mid":
+			if c, ok := parseRGB(val); ok {
+				t.BannerMid = c
+			}
+		case "end":
+			if c, ok := parseRGB(val); ok {
+				t.BannerEnd = c
+			}
+		}
+	case "hint":
+		switch key {
+		case "key":
+			if c, ok := parseRGB(val); ok {
+				t.HintKey = c
+			}
+		case "label":
+			if c, ok := parseRGB(val); ok {
+				t.HintLabel = c
+			}
+		case "sep":
+			if c, ok := parseRGB(val); ok {
+				t.HintSep = c
+			}
+		}
+	case "glow":
+		if key == "tint" {
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				t.GlowTint = max(0, min(1, f))
+			}
+		}
+	case "status":
+		code := ansiCode(strings.Trim(val, `"'`))
+		if code == 0 {
+			return
+		}
+		switch key {
+		case "interrupted":
+			t.StatusInterrupted = code
+		case "build_failed":
+			t.StatusBuildFailed = code
+		case "exit_failed":
+			t.StatusExitFailed = code
+		case "success":
+			t.StatusSuccess = code
+		case "building":
+			t.StatusBuilding = code
+		}
+	}
+}
+
+func writeDefaultColors() error {
+	t := defaultTheme()
+	path := colorsPath()
+	if path == "" {
+		return fmt.Errorf("home dir not found")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		os.Rename(path, path+".bak")
+	}
+	body := fmt.Sprintf(`# PurpNet colors
+# Colors: [R, G, B], 0-255.
+# Status: black/red/green/yellow/blue/magenta/cyan/white, bright_*, dim, bold.
+# Edit and restart ./purp.
+
+[base]
+white      = [%d, %d, %d]
+title_dark = [%d, %d, %d]
+
+[frame]
+border = [%d, %d, %d]
+
+[numbers]
+fg = [%d, %d, %d]
+
+[logo]
+start = [%d, %d, %d]
+end   = [%d, %d, %d]
+
+[title]
+start = [%d, %d, %d]
+end   = [%d, %d, %d]
+
+[banner]
+start = [%d, %d, %d]
+mid   = [%d, %d, %d]
+end   = [%d, %d, %d]
+
+[hint]
+key   = [%d, %d, %d]
+label = [%d, %d, %d]
+sep   = [%d, %d, %d]
+
+[glow]
+tint = %g
+
+[status]
+interrupted  = "yellow"
+build_failed = "red"
+exit_failed  = "red"
+success      = "green"
+building     = "dim"
+`,
+		t.White[0], t.White[1], t.White[2],
+		t.TitleDark[0], t.TitleDark[1], t.TitleDark[2],
+		t.FrameBorder[0], t.FrameBorder[1], t.FrameBorder[2],
+		t.NumberColor[0], t.NumberColor[1], t.NumberColor[2],
+		t.LogoStart[0], t.LogoStart[1], t.LogoStart[2],
+		t.LogoEnd[0], t.LogoEnd[1], t.LogoEnd[2],
+		t.TitleStart[0], t.TitleStart[1], t.TitleStart[2],
+		t.TitleEnd[0], t.TitleEnd[1], t.TitleEnd[2],
+		t.BannerStart[0], t.BannerStart[1], t.BannerStart[2],
+		t.BannerMid[0], t.BannerMid[1], t.BannerMid[2],
+		t.BannerEnd[0], t.BannerEnd[1], t.BannerEnd[2],
+		t.HintKey[0], t.HintKey[1], t.HintKey[2],
+		t.HintLabel[0], t.HintLabel[1], t.HintLabel[2],
+		t.HintSep[0], t.HintSep[1], t.HintSep[2],
+		t.GlowTint,
+	)
+	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+const (
+	fps         = 60
+	appearDur   = 0.2
+	appearLag   = 0.05
+	colorDelay  = appearLag + appearDur
+	colorDur    = 0.6
+	sweepSpread = 0.65
+	sweepJitter = 0.07
+	glowAmount  = 0.5
+	titleText   = "PurpNet!"
+	titleDelay  = 0
+	titleStep   = 0
+	titleFade   = 0.35
+	titleMid    = 0.5
+	titleGap    = 2
+
+	bgQueryTimeout = 180 * time.Millisecond
+
+	tcsetsf = 0x5404
+	tcflsh  = 0x540B
+
+	frameDelay = 1.2
+	frameFade  = 0.45
+	nameDelay  = 1.55
+	nameFade   = 0.35
+	nameStep   = 0.04
+	colCount   = 3
+	colSep     = 3
+	namesGap   = 3
+	leftPad    = 1
+	rightPad   = 1
+	selFadeDur = 0.15
+)
+
+var (
+	logo        = newLogo(" ▐▛██▜▌", "▝▜████▛▘", " ▐▌▐▌▐▌")
+	white       = theme.White
+	gray        = []RGB{theme.LogoStart, theme.LogoEnd}
+	color       = []RGB{theme.TitleStart, theme.TitleEnd}
+	frameBorder = theme.FrameBorder
+	numberColor = theme.NumberColor
+	glow        RGB
+	titleDark   = theme.TitleDark
+	titleRunes  = []rune(titleText)
+
+	versionText        = loadVersion()
+	versionRunes       = []rune(versionText)
+	versionNumText     string
+	versionStatusText  string
+	versionNumRunes    []rune
+	versionStatusRunes []rune
+
+	tools       []Tool
+	frameBox    FrameBox
+	itemsPerCol = 3
+	totalItems  = 0
+
+	baseEnd = math.Max(
+		colorDelay+sweepSpread+sweepJitter+colorDur,
+		math.Max(
+			titleDelay+float64(len(titleRunes)-1)*titleStep+titleFade,
+			math.Max(
+				titleDelay+float64(max(len(versionNumRunes)-1, 0))*titleStep+titleFade,
+				titleDelay+float64(max(len(versionStatusRunes)-1, 0))*titleStep+titleFade,
+			),
+		),
+	)
+
+	lin      [256]float64
+	out      = os.Stdout
+	exitKeys = map[byte]int{3: 130, 4: 0, 28: 131, 'q': 0, 'Q': 0}
+
+	selected  = -1
+	selAlpha  []float64
+	selTarget []float64
+
+	sysSel       = 0
+	sysSelAlpha  []float64
+	sysSelTarget []float64
+
+	curSelAlpha []float64
+
+	mode         = modeTools
+	subSel       = 0
+	subAlpha     []float64
+	subTarget    []float64
+	flatSettings []Setting
+)
+
+const (
+	modeTools   = 0
+	modeSystem  = 1
+	modeConfig  = 2
+	modeCatalog = 3
+	modeCard    = 4
+)
+
+const (
+	keyNone    = -1
+	keyUp      = -2
+	keyDown    = -3
+	keyLeft    = -4
+	keyRight   = -5
+	keyEnter   = -6
+	keyTab     = -7
+	keyBackTab = -8
+	keyEsc     = -9
+)
+
+// purp-patch: pages-v1 consts
+const (
+	pageRows   = 3
+	perPage    = colCount * pageRows
+	winsizeReq = 0x5413 // TIOCGWINSZ
+)
+
+var (
+	page, toolPages = 0, 1
+	termCols    int
+	frameCW     = 7
+)
+
+
+// ─────────────────────── Config ───────────────────────
+
+type Config struct {
+	ShowHints  bool
+	ShowBanner bool
+}
+
+type Setting struct {
+	Name string
+	Get  func() bool
+	Set  func(bool)
+}
+
+type Theme struct {
+	Name     string
+	Settings []Setting
+}
+
+type Subsystem struct {
+	ID   string
+	Name string
+}
+
+var (
+	cfg      Config
+	cfgPath  string
+	sysItems []Tool
+
+	subsystems = []Subsystem{
+		{ID: "config", Name: "Config"},
+		{ID: "catalog", Name: "Catalog"},
+	}
+
+	themes = []Theme{
+		{Name: "Appearance", Settings: []Setting{
+			{Name: "Tips",      Get: func() bool { return cfg.ShowHints },  Set: func(v bool) { cfg.ShowHints = v }},
+			{Name: "Banner",    Get: func() bool { return cfg.ShowBanner }, Set: func(v bool) { cfg.ShowBanner = v }},
+		}},
+		{Name: "Behavior", Settings: nil},
+		{Name: "Network",  Settings: nil},
+	}
+)
+
+func rebuildFlatSettings() {
+	flatSettings = flatSettings[:0]
+	for _, th := range themes {
+		flatSettings = append(flatSettings, th.Settings...)
+	}
+}
+
+func configPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "PurpNet", "config.toml")
+}
+
+func loadConfig() Config {
+	c := Config{ShowHints: true, ShowBanner: true}
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return c
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		b := v == "true"
+		switch strings.TrimSpace(k) {
+		case "show_hints":
+			c.ShowHints = b
+		case "show_banner":
+			c.ShowBanner = b
+		}
+	}
+	return c
+}
+
+func saveConfig() error {
+	if cfgPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		return err
+	}
+	body := fmt.Sprintf("# PurpNet config\nshow_hints = %v\nshow_banner = %v\n",
+		cfg.ShowHints, cfg.ShowBanner)
+	tmp := cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, cfgPath)
+}
+
+func buildSysItems() []Tool {
+	items := make([]Tool, len(subsystems))
+	for i, ss := range subsystems {
+		items[i] = Tool{ID: ss.ID, Name: ss.Name}
+	}
+	return items
+}
+
+func onSys() bool { return mode == modeSystem || mode == modeConfig || mode == modeCatalog || mode == modeCard }
+
+func rebuildCurrentView() {
+	if onSys() {
+		frameBox = newFrameBox(sysItems, 0, 0, termCols)
+	} else {
+		frameBox = newFrameBox(tools, page, toolPages, termCols)
+	}
+}
+
+func fadeAdvance(alpha, target []float64, prev, cur int) {
+	if cur != prev && prev >= 0 && prev < len(target) {
+		target[prev] = 0
+		if cur >= 0 && cur < len(target) {
+			target[cur] = 1
+		}
+	}
+	step := 1.0 / float64(fps) / selFadeDur
+	for i := range alpha {
+		if alpha[i] < target[i] {
+			alpha[i] = min(target[i], alpha[i]+step)
+		} else if alpha[i] > target[i] {
+			alpha[i] = max(target[i], alpha[i]-step)
+		}
+	}
+}
+
+func init() {
+	for i := range lin {
+		lin[i] = math.Pow(float64(i)/255, 2.2)
+	}
+	glow = mix(white, color[0], theme.GlowTint)
+	if parts := strings.SplitN(versionText, " • ", 2); len(parts) > 0 {
+		versionNumText = parts[0]
+		if len(parts) > 1 {
+			versionStatusText = parts[1]
+		}
+	}
+	versionNumRunes = []rune(versionNumText)
+	versionStatusRunes = []rune(versionStatusText)
+}
+
+func versionPaths() []string {
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), "purpnet.toml"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, "PurpNet", "purpnet.toml"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		paths = append(paths, filepath.Join(wd, "purpnet.toml"))
+	}
+	return paths
+}
+
+func tomlValue(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') {
+		if i := strings.IndexByte(s[1:], s[0]); i >= 0 {
+			return s[1 : 1+i]
+		}
+	}
+	if i := strings.Index(s, " #"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if i := strings.Index(s, "\t#"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+func parseVersion(data []byte) (string, error) {
+	var v, st string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "version":
+			v = tomlValue(val)
+		case "status":
+			st = tomlValue(val)
+		}
+	}
+	if v == "" {
+		return "", fmt.Errorf("missing version key")
+	}
+	if st == "" {
+		return v, nil
+	}
+	if r := []rune(st); len(r) > 0 {
+		r[0] = unicode.ToUpper(r[0])
+		st = string(r)
+	}
+	return v + " • " + st, nil
+}
+
+func loadVersion() string {
+	debug := os.Getenv("PURP_DEBUG") != ""
+	paths := versionPaths()
+	var lastErr error
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if debug && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "purp: version: %v\n", err)
+			}
+			lastErr = err
+			continue
+		}
+		text, err := parseVersion(data)
+		if err != nil {
+			if debug {
+				fmt.Fprintf(os.Stderr, "purp: %s: %v\n", path, err)
+			}
+			lastErr = err
+			continue
+		}
+		return text
+	}
+	if debug && lastErr != nil {
+		fmt.Fprintf(os.Stderr, "purp: version.toml not found (tried: %s)\n", strings.Join(paths, ", "))
+	}
+	return ""
+}
+
+func newLogo(src ...string) Logo {
+	l := Logo{h: len(src)}
+	for _, s := range src {
+		rs := []rune(s)
+		l.rows = append(l.rows, rs)
+		l.w = max(l.w, len(rs))
+	}
+	for i, rs := range l.rows {
+		for len(rs) < l.w {
+			rs = append(rs, ' ')
+		}
+		l.rows[i] = rs
+	}
+	return l
+}
+
+func clamp01(v float64) float64 { return max(0, min(1, v)) }
+
+func smoothstep(x float64) float64 {
+	x = clamp01(x)
+	return x * x * (3 - 2*x)
+}
+
+func smootherstep(x float64) float64 {
+	x = clamp01(x)
+	return x * x * x * (x*(x*6-15) + 10)
+}
+
+func mix(a, b RGB, k float64) RGB {
+	if k <= 0 {
+		return a
+	}
+	if k >= 1 {
+		return b
+	}
+	var o RGB
+	for i := range o {
+		la, lb := lin[a[i]], lin[b[i]]
+		o[i] = int(math.Round(255 * math.Pow(clamp01(la+(lb-la)*k), 1/2.2)))
+	}
+	return o
+}
+
+func stopsAt(stops []RGB, t float64) RGB {
+	t = clamp01(t) * float64(len(stops)-1)
+	i := min(int(t), len(stops)-2)
+	return mix(stops[i], stops[i+1], t-float64(i))
+}
+
+func diag(x, y int, wx float64) float64 {
+	return clamp01(wx*float64(x)/float64(max(logo.w-1, 1)) + (1-wx)*float64(y)/float64(max(logo.h-1, 1)))
+}
+
+func jitter(x, y int) float64 {
+	v := math.Sin(float64(x)*12.9898+float64(y)*78.233) * 43758.5453
+	return v - math.Floor(v)
+}
+
+// ─────────────────────── FrameBox ───────────────────────
+
+type FrameCell struct {
+	ch           rune
+	kind         int
+	delay        float64
+	gpos         float64
+	logoX, logoY int
+	charIdx      int
+	isItem       bool
+	itemIdx      int
+}
+
+type FrameBox struct {
+	cells [][]FrameCell
+	w, h  int
+}
+
+// purp-patch: pages-v1
+type winsize struct{ row, col, x, y uint16 }
+
+func termWidth(fd int) int {
+	var ws winsize
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), winsizeReq, uintptr(unsafe.Pointer(&ws)))
+	if e != 0 {
+		return 0
+	}
+	return int(ws.col)
+}
+
+// wideRune: East Asian wide / emoji ranges. They take 2 cells, which would break the frame grid.
+func wideRune(r rune) bool {
+	return r >= 0x1100 && (r <= 0x115F ||
+		(r >= 0x2E80 && r <= 0xA4CF) ||
+		(r >= 0xAC00 && r <= 0xD7A3) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0xFE30 && r <= 0xFE6F) ||
+		(r >= 0xFF00 && r <= 0xFF60) ||
+		(r >= 0xFFE0 && r <= 0xFFE6) ||
+		(r >= 0x1F300 && r <= 0x1FAFF) ||
+		(r >= 0x20000 && r <= 0x3FFFD))
+}
+
+// cleanName guarantees 1 rune = 1 cell: drops control/combining/format runes, wide runes become '?'.
+func cleanName(s string) string {
+	rs := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case unicode.IsControl(r), unicode.Is(unicode.Mn, r), unicode.Is(unicode.Cf, r):
+		case wideRune(r):
+			rs = append(rs, '?')
+		default:
+			rs = append(rs, r)
+		}
+	}
+	return string(rs)
+}
+
+func computeFrameCW() int {
+	cw := 7
+	for _, list := range [][]Tool{tools, sysItems} {
+		if len(list) == 0 {
+			continue
+		}
+		numW := max(2, len(strconv.Itoa(len(list))))
+		for _, t := range list {
+			cw = max(cw, numW+1+utf8.RuneCountInString(cleanName(t.Name)))
+		}
+	}
+	return cw
+}
+
+func newFrameBox(tools []Tool, page, pages, cols int) FrameBox {
+	n := len(tools)
+	numW := max(2, len(strconv.Itoa(n)))
+	names := make([]string, n)
+	cw := frameCW
+	for i, t := range tools {
+		names[i] = cleanName(t.Name)
+	}
+
+	titleLen := len(titleRunes)
+	versionLen := max(max(len(versionNumRunes), len(versionStatusRunes)), 1)
+	textW := max(max(titleLen, versionLen), 1)
+	logoW := logo.w
+	leftBlockW := logoW + titleGap + textW
+
+	// width is the same on every page: cw is taken over all tools, then capped by the terminal
+	fixedW := 2 + leftPad + leftBlockW + namesGap + (colCount-1)*colSep + rightPad
+	if cols > 0 {
+		cw = min(cw, max((cols-fixedW)/colCount, 7))
+	}
+	totalW := fixedW + colCount*cw
+	totalH := max(pageRows, logo.h) + 2
+
+	cells := make([][]FrameCell, totalH)
+	for y := range cells {
+		cells[y] = make([]FrameCell, totalW)
+		for x := range cells[y] {
+			cells[y][x] = FrameCell{ch: ' ', kind: 3}
+		}
+	}
+
+	cells[0][0] = FrameCell{ch: '╭', kind: 0}
+	for x := 1; x < totalW-1; x++ {
+		cells[0][x] = FrameCell{ch: '─', kind: 0}
+	}
+	cells[0][totalW-1] = FrameCell{ch: '╮', kind: 0}
+
+	// " page 2/3 " replaces border cells: right-aligned, 2 dashes before the corner, >=2 after the left one
+	var cornerLabel string
+	switch {
+	case pages > 1:
+		cornerLabel = fmt.Sprintf(" page %d/%d ", page+1, pages)
+	case pages == 0:
+		cornerLabel = "  System  "
+	}
+	if cornerLabel != "" {
+		label := []rune(cornerLabel)
+		if sx := totalW - 3 - len(label); sx >= 3 {
+			for i, ch := range label {
+				cells[0][sx+i] = FrameCell{ch: ch, kind: 8}
+			}
+		}
+	}
+
+	namesStartX := 1 + leftPad + leftBlockW + namesGap
+	namesEndX := namesStartX + colCount*cw + (colCount-1)*colSep - 1
+	span := max(namesEndX-namesStartX, 1)
+
+	contentRows := totalH - 2
+	for y := 0; y < contentRows; y++ {
+		row := y + 1
+		cells[row][0] = FrameCell{ch: '│', kind: 0}
+		cells[row][totalW-1] = FrameCell{ch: '│', kind: 0}
+
+		if y < logo.h {
+			logoStartX := 1 + leftPad
+			for lx := 0; lx < logo.w; lx++ {
+				cells[row][logoStartX+lx] = FrameCell{
+					ch: logo.rows[y][lx], kind: 4, logoX: lx, logoY: y,
+				}
+			}
+		}
+
+		textX := 1 + leftPad + logoW + titleGap
+		if y == 0 {
+			for i, ch := range titleRunes {
+				cells[row][textX+i] = FrameCell{ch: ch, kind: 5, charIdx: i}
+			}
+		} else if y == 1 {
+			for i, ch := range versionNumRunes {
+				cells[row][textX+i] = FrameCell{ch: ch, kind: 6, charIdx: i}
+			}
+		} else if y == 2 {
+			for i, ch := range versionStatusRunes {
+				cells[row][textX+i] = FrameCell{ch: ch, kind: 7, charIdx: i}
+			}
+		}
+
+		if n == 0 {
+			if y == 0 {
+				for i, ch := range []rune("(no tools found)") {
+					cells[row][namesStartX+i] = FrameCell{ch: ch, kind: 3}
+				}
+			}
+			continue
+		}
+
+		for c := 0; c < colCount; c++ {
+			slot := y*colCount + c
+			idx := page*perPage + slot
+			if slot >= perPage || idx >= n {
+				break
+			}
+			name := []rune(names[idx])
+			if room := cw - numW - 1; len(name) > room {
+				name = append(name[:room-1], '…')
+			}
+			label := []rune(fmt.Sprintf("%0*d %s", numW, idx+1, string(name)))
+			colX := namesStartX + c*(cw+colSep)
+			delay := nameDelay + float64(slot)*nameStep
+			for j := 0; j < cw; j++ {
+				var kind int
+				switch {
+				case j < numW:
+					kind = 1
+				case j == numW, j >= len(label):
+					kind = 3
+				default:
+					kind = 2
+				}
+				var ch rune = ' '
+				if j < len(label) {
+					ch = label[j]
+				}
+				gpos := clamp01(float64(colX+j-namesStartX) / float64(span))
+				cells[row][colX+j] = FrameCell{
+					ch: ch, kind: kind, delay: delay, gpos: gpos,
+					isItem: true, itemIdx: idx,
+				}
+			}
+		}
+	}
+
+	last := totalH - 1
+	cells[last][0] = FrameCell{ch: '╰', kind: 0}
+	for x := 1; x < totalW-1; x++ {
+		cells[last][x] = FrameCell{ch: '─', kind: 0}
+	}
+	cells[last][totalW-1] = FrameCell{ch: '╯', kind: 0}
+
+	return FrameBox{cells: cells, w: totalW, h: totalH}
+}
+
+// ─────────────────────── Renderer ───────────────────────
+
+type Renderer struct {
+	grid  [][]Cell
+	buf   []byte
+	bg    RGB
+	plain bool
+}
+
+func newRenderer() *Renderer {
+	r := &Renderer{bg: titleDark, grid: make([][]Cell, logo.h)}
+	for y, row := range logo.rows {
+		r.grid[y] = make([]Cell, logo.w)
+		for x, ch := range row {
+			c := Cell{ch: ch}
+			if ch != ' ' {
+				c.gray = stopsAt(gray, diag(x, y, 0.8))
+				c.target = stopsAt(color, diag(x, y, 0.8))
+				c.start = diag(x, y, 0.5)*sweepSpread + sweepJitter*jitter(x, y)
+			}
+			r.grid[y][x] = c
+		}
+	}
+	return r
+}
+
+func (r Renderer) cell(c Cell, t float64) (RGB, bool) {
+	if c.ch == ' ' {
+		return RGB{}, false
+	}
+	k := smoothstep((t - appearLag) / appearDur)
+	if k <= 0 {
+		return RGB{}, false
+	}
+	s := smootherstep((t - colorDelay - c.start) / colorDur)
+	if s >= 1 {
+		return c.target, true
+	}
+	o := mix(mix(r.bg, c.gray, k), c.target, s)
+	if g := math.Sin(math.Pi * s); g > 0 {
+		o = mix(o, glow, glowAmount*g)
+	}
+	return o, true
+}
+
+func (r Renderer) titleColor(i int, t float64) (RGB, bool) {
+	u := (t - titleDelay - float64(i)*titleStep) / titleFade
+	if u <= 0 {
+		return RGB{}, false
+	}
+	k := smoothstep(u)
+	pos := float64(i) / float64(max(len(titleRunes)-1, 1))
+	end := stopsAt(color, pos)
+	if k >= 1 {
+		return end, true
+	}
+	return mix(r.bg, end, k), true
+}
+
+func (r Renderer) versionColor(i int, t float64) (RGB, bool) {
+	u := (t - titleDelay - float64(i)*titleStep) / titleFade
+	if u <= 0 {
+		return RGB{}, false
+	}
+	k := smootherstep(u)
+	if k >= 1 {
+		return gray[0], true
+	}
+	if k < titleMid {
+		return mix(r.bg, gray[1], k/titleMid), true
+	}
+	return mix(gray[1], gray[0], (k-titleMid)/(1-titleMid)), true
+}
+
+func (r *Renderer) frameCell(c FrameCell, t float64) (rune, RGB, bool) {
+	switch c.kind {
+	case 0:
+		k := smoothstep((t - frameDelay) / frameFade)
+		if k <= 0 {
+			return c.ch, RGB{}, false
+		}
+		return c.ch, mix(r.bg, frameBorder, k), true
+	case 1:
+		k := smoothstep((t - c.delay) / nameFade)
+		if k <= 0 {
+			return c.ch, RGB{}, false
+		}
+		base := numberColor
+		if c.isItem && c.itemIdx < len(curSelAlpha) && curSelAlpha[c.itemIdx] > 0 {
+			base = mix(base, white, curSelAlpha[c.itemIdx])
+		}
+		if k >= 1 {
+			return c.ch, base, true
+		}
+		return c.ch, mix(r.bg, base, k), true
+	case 2:
+		k := smoothstep((t - c.delay) / nameFade)
+		if k <= 0 {
+			return c.ch, RGB{}, false
+		}
+		base := color[0] // flat light purple, no per-column gradient
+		if c.isItem && c.itemIdx < len(curSelAlpha) && curSelAlpha[c.itemIdx] > 0 {
+			base = mix(base, white, curSelAlpha[c.itemIdx])
+		}
+		if k >= 1 {
+			return c.ch, base, true
+		}
+		return c.ch, mix(r.bg, base, k), true
+	case 8:
+		k := smoothstep((t - frameDelay) / frameFade)
+		if k <= 0 {
+			return c.ch, RGB{}, false
+		}
+		return c.ch, mix(r.bg, numberColor, k), true
+	case 4:
+		cell := r.grid[c.logoY][c.logoX]
+		col, ok := r.cell(cell, t)
+		return cell.ch, col, ok
+	case 5:
+		col, ok := r.titleColor(c.charIdx, t)
+		return c.ch, col, ok
+	case 6:
+		col, ok := r.versionColor(c.charIdx, t)
+		return c.ch, col, ok
+	case 7:
+		col, ok := r.versionColor(c.charIdx, t)
+		return c.ch, col, ok
+	default:
+		if c.isItem {
+			k := smoothstep((t - c.delay) / nameFade)
+			if k <= 0 {
+				return c.ch, RGB{}, false
+			}
+			return c.ch, RGB{}, true
+		}
+		return c.ch, RGB{}, false
+	}
+}
+
+func appendFG(b []byte, c RGB) []byte {
+	return fmt.Appendf(b, "\x1b[38;2;%d;%d;%dm", c[0], c[1], c[2])
+}
+
+func (r *Renderer) esc(b []byte, s string) []byte {
+	if r.plain {
+		return b
+	}
+	return append(b, s...)
+}
+
+func (r *Renderer) eol(b []byte) []byte { return r.esc(b, "\x1b[K") }
+func (r *Renderer) paint(b []byte, n int, at func(i int) (rune, RGB, bool)) []byte {
+	var last RGB
+	have := false
+	for i := 0; i < n; i++ {
+		ch, col, ok := at(i)
+		if !ok {
+			b = append(b, ' ')
+			continue
+		}
+		if !r.plain && (!have || col != last) {
+			b = appendFG(b, col)
+			last, have = col, true
+		}
+		b = utf8.AppendRune(b, ch)
+	}
+	return r.esc(b, "\x1b[m")
+}
+
+
+// ─────────────────────── Hint ───────────────────────
+
+const (
+	hintH       = 1
+	hintDelay   = 2.15
+	hintFadeDur = 0.4
+)
+
+type hintSeg struct{ key, label string }
+
+var (
+	hintSegs = []hintSeg{
+		{"⇅⇄", "Navigation"},
+		{"⇥", "Pages"},
+		{"↵", "Run"},
+		{"q", "Quit"},
+	}
+	hintSepStr     = " · "
+	hintKeyColor   = theme.HintKey
+	hintLabelColor = theme.HintLabel
+	hintSepColor   = theme.HintSep
+)
+
+func currentHintSegs() []hintSeg {
+	if mode == modeCard {
+		return HintCard()
+	}
+	if mode == modeCatalog {
+		return HintCatalog()
+	}
+	if mode == modeConfig {
+		return []hintSeg{
+			{"⇅⇄", "Navigation"},
+			{"↵", "Toggle"},
+			{"Esc", "Back"},
+			{"q", "Quit"},
+		}
+	}
+	return hintSegs
+}
+
+func hintWidthFor(segs []hintSeg) int {
+	w := 1
+	for i, seg := range segs {
+		if i > 0 {
+			w += utf8.RuneCountInString(hintSepStr)
+		}
+		w += utf8.RuneCountInString(seg.key) + 1 + utf8.RuneCountInString(seg.label)
+	}
+	return w
+}
+
+func hintWidth() int {
+	return hintWidthFor(currentHintSegs())
+}
+
+func (r *Renderer) paintHint(b []byte, t float64) []byte {
+	if !cfg.ShowHints {
+		return r.esc(b, "\x1b[K")
+	}
+	u := (t - hintDelay) / hintFadeDur
+	if u <= 0 || (termCols > 0 && hintWidth() >= termCols) {
+		return r.esc(b, "\x1b[K")
+	}
+	k := smoothstep(u)
+	fade := func(c RGB) RGB { return mix(r.bg, c, k) }
+	var last RGB
+	have := false
+	emit := func(ch rune, col RGB) {
+		if !r.plain && (!have || col != last) {
+			b = appendFG(b, col)
+			last, have = col, true
+		}
+		b = utf8.AppendRune(b, ch)
+	}
+	b = append(b, ' ')
+	segs := currentHintSegs()
+	for i, seg := range segs {
+		if i > 0 {
+			for _, ch := range hintSepStr {
+				emit(ch, fade(hintSepColor))
+			}
+		}
+		for _, ch := range seg.key {
+			emit(ch, fade(hintKeyColor))
+		}
+		emit(' ', fade(hintLabelColor))
+		for _, ch := range seg.label {
+			emit(ch, fade(hintLabelColor))
+		}
+	}
+	b = r.esc(b, "\x1b[m")
+	return r.esc(b, "\x1b[K")
+}
+
+// fix10: no sync output (Termux glitches)
+func (r *Renderer) frame(t float64, up int) []byte {
+	b := r.buf[:0]
+	if r.plain {
+		t = 1e9
+	}
+	y := topOffset() + 1
+	for _, row := range frameBox.cells {
+		if !r.plain {
+			b = fmt.Appendf(b, "\x1b[%d;1H", y)
+		}
+		b = r.paint(b, len(row), func(i int) (rune, RGB, bool) {
+			return r.frameCell(row[i], t)
+		})
+		b = r.eol(b)
+		y++
+	}
+	if !r.plain {
+		b = fmt.Appendf(b, "\x1b[%d;1H", y)
+	}
+	b = r.paintHint(b, t)
+	b = r.esc(b, "\x1b[J")
+	if mode == modeConfig && !r.plain {
+		b = r.appendConfig(b)
+	}
+	if mode == modeCatalog && !r.plain {
+		b = RenderCatalog(b, topOffset()+frameBox.h+hintH+1)
+	}
+	if mode == modeCard && !r.plain {
+		b = RenderCard(b, topOffset()+frameBox.h+hintH+1)
+	}
+	r.buf = b
+	return b
+}
+
+func (r *Renderer) appendConfig(b []byte) []byte {
+	colW := 0
+	for _, th := range themes {
+		w := utf8.RuneCountInString(th.Name)
+		for _, s := range th.Settings {
+			mark := "[ ]"
+			if s.Get() {
+				mark = "[√]"
+			}
+			l := utf8.RuneCountInString(fmt.Sprintf("%s %s", mark, s.Name))
+			if l > w {
+				w = l
+			}
+		}
+		if w > colW {
+			colW = w
+		}
+	}
+	colW += 4
+	maxRows := 0
+	for _, th := range themes {
+		if len(th.Settings) > maxRows {
+			maxRows = len(th.Settings)
+		}
+	}
+	totalW := len(themes) * colW
+	type cc struct {
+		ch  rune
+		col RGB
+		has bool
+	}
+	grid := make([][]cc, 2+maxRows)
+	for i := range grid {
+		grid[i] = make([]cc, totalW)
+	}
+	for i, th := range themes {
+		x := i * colW
+		for j, ch := range []rune(th.Name) {
+			grid[0][x+j] = cc{ch: ch, col: numberColor, has: true}
+		}
+	}
+	flatIdx := 0
+	for i, th := range themes {
+		x := i * colW
+		for j, st := range th.Settings {
+			mark := "[ ]"
+			if st.Get() {
+				mark = "[√]"
+			}
+			label := []rune(fmt.Sprintf("%s %s", mark, st.Name))
+			alpha := 0.0
+			if flatIdx < len(subAlpha) {
+				alpha = subAlpha[flatIdx]
+			}
+			for k, ch := range label {
+				base := color[0]
+				if k < 3 {
+					base = numberColor
+				}
+				grid[2+j][x+k] = cc{ch: ch, col: mix(base, white, alpha), has: true}
+			}
+			flatIdx++
+		}
+	}
+	y := topOffset() + frameBox.h + hintH + 1
+	for _, row := range grid {
+		if !r.plain {
+			b = fmt.Appendf(b, "\x1b[%d;1H", y)
+		}
+		var last RGB
+		have := false
+		for _, c := range row {
+			if !c.has {
+				b = append(b, ' ')
+				continue
+			}
+			if !have || c.col != last {
+				b = appendFG(b, c.col)
+				last = c.col
+				have = true
+			}
+			b = utf8.AppendRune(b, c.ch)
+		}
+		b = r.esc(b, "\x1b[m")
+		b = r.esc(b, "\x1b[K")
+		y++
+	}
+	return b
+}
+
+func configExtraHeight() int {
+	maxRows := 0
+	for _, th := range themes {
+		if len(th.Settings) > maxRows {
+			maxRows = len(th.Settings)
+		}
+	}
+	return 3 + maxRows
+}
+
+// ─────────────────────── Terminal ───────────────────────
+
+type Terminal struct {
+	fd    int
+	orig  syscall.Termios
+	saved bool
+	raw   bool
+	keys  bool
+	alt   bool
+}
+
+func ioctl(fd int, req uintptr, t *syscall.Termios) bool {
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(unsafe.Pointer(t)))
+	return e == 0
+}
+
+func isTTY(fd int) bool {
+	var t syscall.Termios
+	return ioctl(fd, syscall.TCGETS, &t)
+}
+
+func (t *Terminal) enterRaw() {
+	if !t.saved {
+		if !ioctl(t.fd, syscall.TCGETS, &t.orig) {
+			return
+		}
+		t.saved = true
+	}
+	s := t.orig
+	s.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	s.Iflag &^= syscall.IXON | syscall.ICRNL
+	s.Cc[syscall.VMIN], s.Cc[syscall.VTIME] = 0, 0
+	if t.raw = ioctl(t.fd, syscall.TCSETS, &s); t.raw {
+		t.keys = true
+		t.flush()
+	}
+}
+
+func (t *Terminal) flush() {
+	if t.raw {
+		syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), tcflsh, 0)
+	}
+}
+
+func (t *Terminal) enterAlt() {
+	if t.alt {
+		return
+	}
+	out.WriteString("\x1b[?1049h\x1b[2J\x1b[H")
+	t.alt = true
+}
+
+func (t *Terminal) exitAlt() {
+	if !t.alt {
+		return
+	}
+	out.WriteString("\x1b[?1049l")
+	t.alt = false
+}
+
+func (t *Terminal) read(p []byte) int {
+	for {
+		n, err := syscall.Read(t.fd, p)
+		switch err {
+		case nil:
+			return n
+		case syscall.EINTR:
+		case syscall.EAGAIN:
+			return 0
+		default:
+			return -1
+		}
+	}
+}
+
+func daDone(resp []byte) bool {
+	i := bytes.LastIndex(resp, []byte("\x1b[?"))
+	return i >= 0 && bytes.IndexByte(resp[i:], 'c') >= 0
+}
+
+func parseOSC11(resp []byte) (RGB, bool) {
+	_, rest, ok := strings.Cut(string(resp), "rgb:")
+	if !ok {
+		return RGB{}, false
+	}
+	if i := strings.IndexAny(rest, "\x07\x1b"); i >= 0 {
+		rest = rest[:i]
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 3 {
+		return RGB{}, false
+	}
+	var c RGB
+	for i := range c {
+		h := strings.TrimSpace(parts[i])
+		v, err := strconv.ParseUint(h, 16, 32)
+		if err != nil || len(h) > 4 {
+			return RGB{}, false
+		}
+		c[i] = int(v * 255 / (uint64(1)<<(4*len(h)) - 1))
+	}
+	return c, true
+}
+
+func (t *Terminal) queryBg(def RGB) RGB {
+	out.WriteString("\x1b]11;?\x07\x1b[c")
+	var resp []byte
+	buf := make([]byte, 128)
+	for end := time.Now().Add(bgQueryTimeout); time.Now().Before(end) && len(resp) < 256 && !daDone(resp); {
+		n := t.read(buf)
+		if n < 0 {
+			break
+		}
+		if n == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		resp = append(resp, buf[:n]...)
+	}
+	if c, ok := parseOSC11(resp); ok {
+		return c
+	}
+	return def
+}
+
+func (t *Terminal) start() {
+	out.WriteString("\x1b[?25l\x1b[?2004l\x1b[?7l")
+}
+
+func (t *Terminal) pollKey(buf []byte) int {
+	for t.keys {
+		n := t.read(buf)
+		if n < 0 {
+			t.keys = false
+			t.enableISIG()
+			break
+		}
+		if n == 0 {
+			break
+		}
+		s := buf[:n]
+		if len(s) == 1 && s[0] == 0x1b {
+			return keyEsc
+		}
+		for i := 0; i+2 < len(s); i++ {
+			if s[i] == 0x1b && (s[i+1] == '[' || s[i+1] == 'O') {
+				switch s[i+2] {
+				case 'A':
+					return keyUp
+				case 'B':
+					return keyDown
+				case 'C':
+					return keyRight
+				case 'D':
+					return keyLeft
+				case 'Z':
+					return keyBackTab
+				}
+			}
+		}
+		for _, c := range s {
+			if c == 13 || c == 10 {
+				return keyEnter
+			}
+			if c == 9 {
+				return keyTab
+			}
+			if code, ok := exitKeys[c]; ok {
+				return code
+			}
+		}
+	}
+	return keyNone
+}
+
+func (t *Terminal) enableISIG() {
+	var s syscall.Termios
+	if ioctl(t.fd, syscall.TCGETS, &s) {
+		s.Lflag |= syscall.ISIG
+		ioctl(t.fd, syscall.TCSETS, &s)
+	}
+}
+
+func (t *Terminal) restore() {
+	if t.raw {
+		ioctl(t.fd, tcsetsf, &t.orig)
+		t.raw = false
+	}
+	out.WriteString("\x1b[?7h\x1b[?2004h\x1b[?25h\x1b[m")
+}
+
+func (t *Terminal) abort(code, lines int) {
+	t.restore()
+	t.exitAlt()
+	os.Exit(code)
+}
+
+// ─────────────────────── run tool ───────────────────────
+
+// purp-patch: tools-v2
+func runSelectedTool(tool Tool, term *Terminal, sig chan os.Signal) {
+	term.restore()
+	fmt.Printf("\x1b[%d;1H\x1b[J", topOffset()+frameBox.h+1+hintH)
+	fmt.Print("output tools:")
+	fmt.Print("\x1b[1B\r")
+
+	res := tool.Run(sig)
+	if res.Sig != nil {
+		term.abort(128+int(res.Sig.(syscall.Signal)), 0)
+	}
+
+	quiet := tool.Pause == pauseNone && (res.Err == nil || res.Interrupted)
+	if !quiet {
+		fmt.Printf("\n%s\n\nPress any key to return to menu...", res.Status())
+	}
+	term.enterRaw()
+	if !quiet {
+		buf := make([]byte, 16)
+		for term.raw && term.read(buf) == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	// fix6: no clear-screen (flicker), hide cursor before home
+	term.start()
+	fmt.Print("\x1b[H")
+}
+
+// ─────────────────────── main ───────────────────────
+
+// purp-patch: banner-v1
+const (
+	splashIn  = 0.55
+	splashLag = 0.25
+	splashDur = splashIn + splashLag
+)
+
+var (
+	bannerShown  bool
+	termRowsN    int
+	lastResizeAt time.Time
+	pendingW     int
+	pendingH     int
+)
+
+var (
+	bannerArt = newLogo(
+		"   ▄███████▄ ███    █▄     ▄████████    ▄███████▄ ",
+		"  ███    ███ ███    ███   ███    ███   ███    ███ ",
+		"  ███    ███ ███    ███   ███    ███   ███    ███ ",
+		"  ███    ███ ███    ███  ▄███▄▄▄▄██▀   ███    ███ ",
+		"▀█████████▀  ███    ███ ▀▀███▀▀▀▀▀   ▀█████████▀  ",
+		"  ███        ███    ███ ▀███████████   ███        ",
+		"  ███        ███    ███   ███    ███   ███        ",
+		" ▄████▀      ████████▀    ███    ███  ▄████▀      ",
+		"                          ███    ███",
+	)
+	bannerStops = []RGB{theme.BannerStart, theme.BannerMid, theme.BannerEnd}
+)
+
+func termRows(fd int) int {
+	var ws winsize
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), winsizeReq, uintptr(unsafe.Pointer(&ws)))
+	if e != 0 {
+		return 0
+	}
+	return int(ws.row)
+}
+
+// bannerFits: 0 means "size unknown" and is treated as fitting.
+func bannerFits(cols, rows int) bool {
+	if !cfg.ShowBanner {
+		return false
+	}
+	return (cols == 0 || cols >= bannerArt.w) && (rows == 0 || rows >= bannerArt.h+1+frameBox.h+1)
+}
+
+func topOffset() int {
+	if bannerShown {
+		return bannerArt.h + 1
+	}
+	return 0
+}
+
+func (r *Renderer) bannerStatic() []byte {
+	return append([]byte(nil), r.splashFrame(splashDur)...)
+}
+
+// splashFrame draws the banner at the top-left corner with a diagonal fade-in.
+func (r *Renderer) splashFrame(t float64) []byte {
+	b := r.buf[:0]
+	var last RGB
+	have := false
+	for y, row := range bannerArt.rows {
+		if !r.plain {
+			b = fmt.Appendf(b, "\x1b[%d;1H", y+1)
+		}
+		for x, ch := range row {
+			if ch == ' ' {
+				b = append(b, ' ')
+				continue
+			}
+			d := 0.7*float64(x)/float64(max(bannerArt.w-1, 1)) + 0.3*float64(y)/float64(max(bannerArt.h-1, 1))
+			k := smoothstep((t - splashLag*d) / splashIn)
+			col := mix(r.bg, stopsAt(bannerStops, d), k)
+			if !have || col != last {
+				b = appendFG(b, col)
+				last, have = col, true
+			}
+			b = utf8.AppendRune(b, ch)
+		}
+		b = append(b, "\x1b[m\x1b[K"...)
+		have = false
+	}
+	r.buf = b
+	return b
+}
+
+// purp-patch: pages-v1 main
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--init-colors" {
+		if err := writeDefaultColors(); err != nil {
+			fmt.Fprintln(os.Stderr, "purp:", err)
+			os.Exit(1)
+		}
+		fmt.Println("created:", colorsPath())
+		return
+	}
+	if !isTTY(1) || os.Getenv("TERM") == "dumb" {
+		return
+	}
+
+	tools = LoadTools()
+	if len(tools) == 0 {
+		MakeSample()
+		tools = LoadTools()
+	}
+	totalItems = len(tools)
+	itemsPerCol = max((totalItems+colCount-1)/colCount, 1)
+	toolPages = max((totalItems+perPage-1)/perPage, 1)
+	// fix3: load config BEFORE first newFrameBox (logo/banner/hints need it)
+	cfgPath = configPath()
+	cfg = loadConfig()
+	rebuildFlatSettings()
+	sysItems = buildSysItems()
+	frameCW = computeFrameCW()
+	sysSelAlpha = make([]float64, max(len(sysItems), 1))
+	sysSelTarget = make([]float64, max(len(sysItems), 1))
+	if len(sysItems) > 0 {
+		sysSel = 0
+		sysSelAlpha[0] = 1
+		sysSelTarget[0] = 1
+	}
+	subAlpha = make([]float64, max(len(flatSettings), 1))
+	subTarget = make([]float64, max(len(flatSettings), 1))
+
+	termCols = termWidth(int(out.Fd()))
+	frameBox = newFrameBox(tools, page, toolPages, termCols)
+	selAlpha = make([]float64, max(totalItems, 1))
+	selTarget = make([]float64, max(totalItems, 1))
+	if totalItems > 0 {
+		selected = 0
+		selAlpha[0] = 1
+		selTarget[0] = 1
+	}
+	curSelAlpha = selAlpha
+
+	r := newRenderer()
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		r.plain = true
+		for page = 0; page < toolPages; page++ {
+			frameBox = newFrameBox(tools, page, toolPages, termCols)
+			out.Write(r.frame(0, 0))
+		}
+		frameBox = newFrameBox(sysItems, 0, 0, termCols)
+		out.Write(r.frame(0, 0))
+		return
+	}
+	term := &Terminal{fd: int(os.Stdin.Fd())}
+	defer func() { term.restore(); term.exitAlt() }()
+	term.enterAlt()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	term.enterRaw()
+	if term.raw {
+		r.bg = term.queryBg(titleDark)
+		term.flush()
+	}
+	term.start()
+	tick := time.NewTicker(time.Second / fps)
+	defer tick.Stop()
+	start := time.Now()
+	keys := make([]byte, 128)
+	lines := 0
+	termRowsN = termRows(int(out.Fd()))
+	pendingW, pendingH = termCols, termRowsN
+	bannerShown = bannerFits(termCols, termRowsN)
+	InitCatalog()
+	splashOn := bannerShown
+	for {
+		t := time.Since(start).Seconds()
+		code := term.pollKey(keys)
+		select {
+		case s := <-sig:
+			code = 128 + int(s.(syscall.Signal))
+		default:
+		}
+		// fix8: detect resize, only remember (debounced apply below)
+		if w, h := termWidth(int(out.Fd())), termRows(int(out.Fd())); w != pendingW || h != pendingH {
+			pendingW, pendingH = w, h
+			lastResizeAt = time.Now()
+		}
+		// fix8: apply only if stable for 150ms AND actually different
+		if !lastResizeAt.IsZero() && time.Since(lastResizeAt) > 150*time.Millisecond {
+			if pendingW != termCols || pendingH != termRowsN {
+				termCols, termRowsN = pendingW, pendingH
+				rebuildCurrentView()
+				bannerShown = bannerFits(termCols, termRowsN)
+				out.WriteString("\x1b[H\x1b[J")
+				if splashOn && !bannerShown {
+					splashOn = false
+					start = time.Now()
+				}
+				if bannerShown && !splashOn {
+					out.Write(r.bannerStatic())
+				}
+				lines = 0
+			}
+			lastResizeAt = time.Time{}
+		}
+		// splash: any key skips it, quit keys and signals still work
+		if splashOn {
+			if code >= 0 {
+				term.abort(code, lines)
+			}
+			if t >= splashDur || code != keyNone {
+				splashOn = false
+				out.Write(r.bannerStatic())
+				start = time.Now()
+				lines = 0
+				continue
+			}
+			out.Write(r.splashFrame(t))
+			<-tick.C
+			continue
+		}
+		if mode == modeCatalog {
+			consumed, newMode := HandleCatalogKey(code)
+			if consumed {
+				if newMode != mode {
+					mode = newMode
+					lines = 0
+				}
+				code = keyNone
+			}
+		}
+		if mode == modeCard {
+			consumed, newMode, run := HandleCardKey(code)
+			if run {
+				if tool, err := getCurrentTool(); err == nil {
+					runSelectedTool(tool, term, sig)
+					mode = modeCatalog
+					lines = 0
+					start = time.Now().Add(-time.Hour)
+					if bannerShown {
+						out.Write(r.bannerStatic())
+					}
+					continue
+				} else {
+					setCardErr(err.Error())
+					code = keyNone
+				}
+			}
+			if consumed {
+				if newMode != mode {
+					mode = newMode
+					lines = 0
+				}
+				code = keyNone
+			}
+		}
+		prev := selected
+		prevSys := sysSel
+		prevSub := subSel
+		switch code {
+		case keyUp:
+			switch mode {
+			case modeTools:
+				if selected >= 0 && selected%perPage >= colCount {
+					selected -= colCount
+				}
+			case modeSystem:
+				if sysSel >= colCount {
+					sysSel -= colCount
+				}
+			case modeConfig:
+				if subSel > 0 {
+					subSel--
+				}
+			}
+		case keyDown:
+			switch mode {
+			case modeTools:
+				if selected >= 0 && selected%perPage+colCount < perPage && selected+colCount < totalItems {
+					selected += colCount
+				}
+			case modeSystem:
+				if sysSel+colCount < len(sysItems) {
+					sysSel += colCount
+				}
+			case modeConfig:
+				if subSel+1 < len(flatSettings) {
+					subSel++
+				}
+			}
+		case keyLeft:
+			switch mode {
+			case modeTools:
+				if selected > 0 && selected%colCount > 0 {
+					selected--
+				}
+			case modeSystem:
+				if sysSel > 0 && sysSel%colCount > 0 {
+					sysSel--
+				}
+			case modeConfig:
+				if subSel > 0 {
+					subSel--
+				}
+			}
+		case keyRight:
+			switch mode {
+			case modeTools:
+				if selected >= 0 && selected%colCount < colCount-1 && selected+1 < totalItems {
+					selected++
+				}
+			case modeSystem:
+				if sysSel >= 0 && sysSel%colCount < colCount-1 && sysSel+1 < len(sysItems) {
+					sysSel++
+				}
+			case modeConfig:
+				if subSel+1 < len(flatSettings) {
+					subSel++
+				}
+			}
+		case keyTab, keyBackTab: // fix4: Tab pages tools first, then System
+			if mode == modeTools {
+				if code == keyTab {
+					if page+1 < toolPages {
+						page++
+						selected = page * perPage
+						if selected >= totalItems {
+							selected = totalItems - 1
+						}
+						rebuildCurrentView()
+					} else {
+						mode = modeSystem
+						rebuildCurrentView()
+					}
+				} else {
+					if page > 0 {
+						page--
+						selected = page * perPage
+						rebuildCurrentView()
+					} else {
+						mode = modeSystem
+						rebuildCurrentView()
+					}
+				}
+			} else if mode == modeSystem {
+				mode = modeTools
+				page = 0
+				selected = 0
+				rebuildCurrentView()
+			}
+		case keyEsc:
+			if mode == modeConfig || mode == modeCatalog {
+				mode = modeSystem
+			}
+		case keyEnter:
+			switch mode {
+			case modeTools:
+				if selected >= 0 && selected < totalItems {
+					runSelectedTool(tools[selected], term, sig)
+					if bannerShown {
+						out.Write(r.bannerStatic())
+					}
+					lines = 0
+					start = time.Now().Add(-time.Hour)
+					continue
+				}
+			case modeSystem:
+				if sysSel >= 0 && sysSel < len(sysItems) {
+					switch sysItems[sysSel].ID {
+					case "config":
+						mode = modeConfig
+						rebuildFlatSettings()
+						if subSel >= len(flatSettings) {
+							subSel = max(len(flatSettings)-1, 0)
+						}
+					case "catalog":
+						reloadCatalog()
+						refreshTools()
+						mode = modeCatalog
+						lines = 0
+					}
+				}
+			case modeConfig:
+				if subSel >= 0 && subSel < len(flatSettings) {
+					st := flatSettings[subSel]
+					st.Set(!st.Get())
+					saveConfig()
+					rebuildCurrentView()
+					bannerShown = bannerFits(termCols, termRowsN)
+					out.WriteString("\x1b[H")
+					if bannerShown {
+						out.Write(r.bannerStatic())
+					}
+					lines = 0
+					start = time.Now().Add(-time.Hour)
+				}
+			}
+		default:
+			if code >= 0 {
+				term.abort(code, lines)
+			}
+		}
+		switch mode {
+		case modeTools:
+			fadeAdvance(selAlpha, selTarget, prev, selected)
+			curSelAlpha = selAlpha
+		case modeSystem, modeCatalog:
+			fadeAdvance(sysSelAlpha, sysSelTarget, prevSys, sysSel)
+			curSelAlpha = sysSelAlpha
+		case modeConfig:
+			fadeAdvance(subAlpha, subTarget, prevSub, subSel)
+			curSelAlpha = subAlpha
+		}
+		out.Write(r.frame(t, lines))
+		if mode == modeConfig {
+			lines = frameBox.h + hintH + configExtraHeight()
+		} else if mode == modeCard {
+			lines = frameBox.h + hintH + cardLines()
+		} else {
+			lines = frameBox.h + hintH
+		}
+		<-tick.C
+	}
+}

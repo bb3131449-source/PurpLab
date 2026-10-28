@@ -1,0 +1,324 @@
+package main
+
+// purp-catalog — remote tool catalog
+// Step 1: Repo type + repos.toml load/save + cache dir.
+// Step 2: HTTP fetch — manifest, tool, download to cache.
+// Not wired into purp.go yet (modes/render come in later steps).
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// Repo — one remote tools repository.
+type Repo struct {
+	Name string // display name
+	URL  string // base URL, tools live at <URL>/<id>.go, index at <URL>/manifest.txt
+}
+
+const (
+	httpUA       = "purpnet/1"
+	maxToolBytes = 1 << 20 // 1 MiB — guard against huge responses
+	httpTimeout  = 10 * time.Second
+)
+
+var httpClient = &http.Client{Timeout: httpTimeout}
+
+// ─── Paths ───
+
+func purpRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "PurpNet")
+}
+
+func reposPath() string {
+	root := purpRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "repos.toml")
+}
+
+func cacheRoot() string {
+	root := purpRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "cache")
+}
+
+func repoCacheDir(repo Repo) string {
+	root := cacheRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, safeName(repo.Name))
+}
+
+func safeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "repo"
+	}
+	return b.String()
+}
+
+// validID: tool id must be a plain file name — no path separators, no "." / "..".
+func validID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ─── repos.toml ───
+
+// LoadRepos reads ~/PurpNet/repos.toml. Missing file → empty list.
+func LoadRepos() []Repo {
+	path := reposPath()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []Repo
+	var cur *Repo
+	flush := func() {
+		if cur != nil && (cur.Name != "" || cur.URL != "") {
+			if cur.Name == "" {
+				cur.Name = cur.URL
+			}
+			out = append(out, *cur)
+		}
+		cur = nil
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line == "[[repo]]" {
+			flush()
+			cur = &Repo{}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		switch strings.TrimSpace(k) {
+		case "name":
+			cur.Name = v
+		case "url":
+			cur.URL = v
+		}
+	}
+	flush()
+	return out
+}
+
+// SaveRepos writes repos to ~/PurpNet/repos.toml atomically.
+func SaveRepos(list []Repo) error {
+	path := reposPath()
+	if path == "" {
+		return fmt.Errorf("home dir not found")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString("# PurpNet repos\n")
+	b.WriteString("# [[repo]]\\nname = \\\"...\\\"\\nurl  = \\\"...\\\"\\n")
+	for _, r := range list {
+		b.WriteString("\n[[repo]]\n")
+		b.WriteString("name = ")
+		b.WriteString(quoteTOML(r.Name))
+		b.WriteString("\nurl  = ")
+		b.WriteString(quoteTOML(r.URL))
+		b.WriteString("\n")
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func quoteTOML(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '\n':
+			b.WriteString("\\n")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// ─── HTTP ───
+
+func httpGet(url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", httpUA)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxToolBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxToolBytes {
+		return nil, fmt.Errorf("file too large (>%d bytes)", maxToolBytes)
+	}
+	return data, nil
+}
+
+func manifestURL(repo Repo) string {
+	return strings.TrimRight(repo.URL, "/") + "/manifest.txt"
+}
+
+func toolURL(repo Repo, id string) string {
+	return strings.TrimRight(repo.URL, "/") + "/" + id + ".go"
+}
+
+// fetchManifest fetches <URL>/manifest.txt and returns the list of tool ids.
+// One id per line, blanks and #-comments ignored, invalid ids skipped, duplicates removed.
+func fetchManifest(repo Repo) ([]string, error) {
+	data, err := httpGet(manifestURL(repo))
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !validID(line) {
+			continue
+		}
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		ids = append(ids, line)
+	}
+	return ids, nil
+}
+
+// fetchTool fetches <URL>/<id>.go.
+func fetchTool(repo Repo, id string) ([]byte, error) {
+	if !validID(id) {
+		return nil, fmt.Errorf("invalid id: %q", id)
+	}
+	return httpGet(toolURL(repo, id))
+}
+
+// downloadTool fetches <id>.go and stores it in the repo cache. Returns the cached path.
+// Idempotent: if the file already exists, returns its path without re-fetching.
+func downloadTool(repo Repo, id string) (string, error) {
+	if !validID(id) {
+		return "", fmt.Errorf("invalid id: %q", id)
+	}
+	dir := repoCacheDir(repo)
+	if dir == "" {
+		return "", fmt.Errorf("cache dir not available")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, id+".go")
+	if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
+		return path, nil
+	}
+	data, err := fetchTool(repo, id)
+	if err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// forceDownload ignores the cache and re-fetches the tool.
+func forceDownload(repo Repo, id string) (string, error) {
+	dir := repoCacheDir(repo)
+	if dir == "" {
+		return "", fmt.Errorf("cache dir not available")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	data, err := fetchTool(repo, id)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, id+".go")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// purgeRepoCache removes ~/PurpNet/cache/<repo>/ entirely.
+func purgeRepoCache(repo Repo) error {
+	dir := repoCacheDir(repo)
+	if dir == "" {
+		return nil
+	}
+	return os.RemoveAll(dir)
+}
